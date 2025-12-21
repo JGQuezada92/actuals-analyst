@@ -1,0 +1,28 @@
+# NetSuite Financial Analyst Agent - Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core LLM Providers (install based on ACTIVE_MODEL)
+google-generativeai>=0.3.0    # For Gemini models
+anthropic>=0.18.0             # For Claude models (optional)
+openai>=1.12.0                # For GPT models (optional)
+
+# Slack Integration
+slack-bolt>=1.18.0
+slack-sdk>=3.26.0
+
+# HTTP Client
+requests>=2.31.0
+
+# Data Processing
+pandas>=2.0.0                 # Optional: for advanced data manipulation
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0               # Optional: enhanced styling
+
+# Utilities
+python-dotenv>=1.0.0          # Environment variable management
+
+# Development & Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
