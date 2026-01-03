@@ -69,6 +69,7 @@ class ChartGenerator:
                 'axes.spines.right': False,
             })
         except ImportError:
+            # Don't raise - let caller handle None return
             raise ImportError("Install matplotlib: pip install matplotlib")
     
     def _save_chart(self, fig, title: str, chart_type: str) -> ChartOutput:
@@ -370,6 +371,10 @@ class ChartGenerator:
         return self._save_chart(fig, title, "waterfall")
 
 # Factory function
-def get_chart_generator(output_dir: str = ".charts") -> ChartGenerator:
-    """Get a chart generator instance."""
-    return ChartGenerator(output_dir)
+def get_chart_generator(output_dir: str = ".charts"):
+    """Get a chart generator instance, or None if matplotlib is not available."""
+    try:
+        return ChartGenerator(output_dir)
+    except ImportError:
+        logger.warning("Matplotlib not available - chart generation disabled")
+        return None

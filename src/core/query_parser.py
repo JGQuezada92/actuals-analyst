@@ -31,6 +31,14 @@ from src.core.financial_semantics import (
     SemanticTerm,
 )
 
+# Dynamic registry import (optional - gracefully handles if not available)
+try:
+    from src.core.dynamic_registry import get_dynamic_registry, EntityType, RegistryMatch
+    DYNAMIC_REGISTRY_AVAILABLE = True
+except ImportError:
+    DYNAMIC_REGISTRY_AVAILABLE = False
+    logger.debug("Dynamic registry not available")
+
 logger = logging.getLogger(__name__)
 
 class QueryIntent(Enum):
@@ -222,6 +230,11 @@ class QueryParser:
         """
         self.fiscal_calendar = fiscal_calendar or get_fiscal_calendar()
         self.llm_router = llm_router
+        # NEW: Add dynamic registry
+        if DYNAMIC_REGISTRY_AVAILABLE:
+            self.dynamic_registry = get_dynamic_registry()
+        else:
+            self.dynamic_registry = None
     
     def parse(self, query: str, context: Dict[str, Any] = None) -> ParsedQuery:
         """
@@ -256,7 +269,7 @@ class QueryParser:
         
         # Extract departments (now aware of account-based terms and compound terms to exclude)
         semantic_matched_ranges = semantic_result.get("matched_ranges", [])
-        departments = self._extract_departments(query, semantic_matched_ranges)
+        departments, dept_clarification = self._extract_departments(query, semantic_matched_ranges)
         
         # Merge semantic department filters (avoid duplicates, case-insensitive)
         if semantic_result.get("departments"):
@@ -293,6 +306,12 @@ class QueryParser:
         ambiguous_terms = semantic_result.get("ambiguous_terms", [])
         semantic_terms = semantic_result.get("semantic_terms", [])
         is_consolidated = semantic_result.get("is_consolidated", False)
+        
+        # NEW: Add dynamic clarification if needed (from department extraction)
+        if dept_clarification and not requires_disambiguation:
+            requires_disambiguation = True
+            disambiguation_message = dept_clarification["message"]
+            ambiguous_terms = [dept_clarification["term"]]
         
         # Extract subsidiaries from semantic filters
         subsidiaries = semantic_result.get("subsidiaries", [])
@@ -586,24 +605,26 @@ class QueryParser:
         self, 
         query: str, 
         semantic_matched_ranges: List[Tuple[int, int]] = None
-    ) -> List[str]:
+    ) -> Tuple[List[str], Optional[Dict]]:
         """
         Extract department names from the query.
         
-        This method now uses the financial_semantics module to avoid
-        incorrectly mapping account-based terms (like "revenue") to departments.
-        
-        It also checks if a matched term overlaps with a compound term range
-        (e.g., "marketing" in "sales and marketing cost" should not be extracted
-        as a department because it's part of a compound account term).
+        Uses a tiered approach:
+        1. Static patterns (for well-known patterns like "sales department")
+        2. Dynamic registry (for data-discovered departments)
         
         Args:
             query: The user's query
             semantic_matched_ranges: Character ranges already claimed by semantic terms
+        
+        Returns:
+            Tuple of (departments_list, clarification_info)
         """
         departments = []
+        clarification_needed = None
         query_lower = query.lower()
         
+        # Step 1: Try static patterns first (existing logic)
         for pattern in self.DEPARTMENT_PATTERNS:
             for match in re.finditer(pattern, query, re.IGNORECASE):
                 dept = match.group().strip()
@@ -636,7 +657,177 @@ class QueryParser:
                 if dept_normalized and dept_normalized not in departments:
                     departments.append(dept_normalized)
         
-        return departments
+        # Step 2: Try dynamic registry for potential department terms not matched by patterns
+        if self.dynamic_registry and not self.dynamic_registry.is_empty():
+            potential_terms = self._extract_potential_entity_terms(query, semantic_matched_ranges)
+            
+            for term in potential_terms:
+                # Skip if already matched by static patterns
+                if any(term.lower() in d.lower() for d in departments):
+                    continue
+                
+                # Check dynamic registry
+                resolved, clarification = self._resolve_entity_dynamic(term, EntityType.DEPARTMENT)
+                
+                if resolved:
+                    for dept in resolved:
+                        if dept not in departments:
+                            departments.append(dept)
+                elif clarification:
+                    # Multiple matches found - need clarification
+                    clarification_needed = clarification
+                    # Don't add to departments yet - wait for user response
+        
+        return departments, clarification_needed
+    
+    def _resolve_entity_dynamic(
+        self, 
+        term: str, 
+        entity_type: EntityType
+    ) -> Tuple[Optional[List[str]], Optional[Dict]]:
+        """
+        Resolve an entity term using the dynamic registry.
+        
+        Args:
+            term: The term to resolve (e.g., "GPS", "Sales NA")
+            entity_type: The type of entity to look for
+        
+        Returns:
+            Tuple of (resolved_values, clarification_info)
+            - resolved_values: List of canonical names if resolved, None if not found
+            - clarification_info: Dict with clarification details if needed, None otherwise
+        """
+        if not self.dynamic_registry or self.dynamic_registry.is_empty():
+            # Registry not yet built - will be populated on first data fetch
+            logger.debug(f"Dynamic registry is empty, cannot resolve '{term}'")
+            return None, None
+        
+        match = self.dynamic_registry.lookup(term, entity_type)
+        
+        if match.is_empty:
+            # Term not found in registry
+            return None, None
+        
+        if match.is_exact:
+            # Single confident match - return the canonical name
+            return [match.best_match.canonical_name], None
+        
+        if match.needs_clarification:
+            # Multiple matches - need user clarification
+            clarification = {
+                "term": term,
+                "type": entity_type.value,
+                "options": match.clarification_options[:10],
+                "message": self._build_clarification_message(term, entity_type, match),
+            }
+            return None, clarification
+        
+        # Lower confidence but single match - use it
+        if match.best_match:
+            return [match.best_match.canonical_name], None
+        
+        return None, None
+    
+    def _build_clarification_message(
+        self, 
+        term: str, 
+        entity_type: EntityType, 
+        match: RegistryMatch
+    ) -> str:
+        """Build a user-friendly clarification message."""
+        type_name = {
+            EntityType.DEPARTMENT: "department",
+            EntityType.ACCOUNT: "account",
+            EntityType.ACCOUNT_NUMBER: "account number",
+            EntityType.SUBSIDIARY: "subsidiary",
+            EntityType.TRANSACTION_TYPE: "transaction type",
+        }.get(entity_type, "entity")
+        
+        options_str = "\n".join(
+            f"  {i+1}. {opt}" 
+            for i, opt in enumerate(match.clarification_options[:10])
+        )
+        
+        return (
+            f'"{term}" matches multiple {type_name}s:\n'
+            f'{options_str}\n\n'
+            f'Which one did you mean? You can also say "all" for a consolidated view.'
+        )
+    
+    def _extract_potential_entity_terms(
+        self, 
+        query: str, 
+        semantic_matched_ranges: List[Tuple[int, int]] = None
+    ) -> List[str]:
+        """
+        Extract words/phrases that might be entity names (departments, accounts, etc.).
+        
+        Filters out common stop words, time periods, and financial terms that are
+        already handled by the semantic system.
+        """
+        query_lower = query.lower()
+        
+        # Words to exclude (handled elsewhere or too common)
+        stop_words = {
+            # Common query words
+            "what", "are", "the", "show", "me", "give", "provide", "list", "get",
+            "for", "by", "in", "of", "and", "or", "to", "from", "with", "about",
+            "how", "much", "many", "which", "where", "when", "why", "can", "could",
+            
+            # Financial terms (handled by semantic system)
+            "expenses", "expense", "revenue", "revenues", "cost", "costs", "spend",
+            "spending", "income", "total", "sum", "breakdown", "analysis", "report",
+            "budget", "actual", "variance", "profit", "loss", "margin",
+            
+            # Time terms (handled by fiscal calendar)
+            "ytd", "mtd", "qtd", "ttm", "trailing", "months", "month", "quarters",
+            "quarter", "year", "years", "current", "last", "prior", "previous",
+            "this", "that", "today", "yesterday", "week", "weekly", "monthly",
+            "quarterly", "annually", "fy", "fiscal",
+            
+            # Account type terms
+            "accounts", "account", "assets", "liabilities", "equity",
+            "operating", "cogs", "opex",
+        }
+        
+        # Extract words
+        words = re.findall(r'\b[a-zA-Z][a-zA-Z0-9\-&]+\b', query_lower)
+        potential_terms = []
+        
+        for word in words:
+            if word not in stop_words and len(word) > 1:
+                # Check if word is within a semantic matched range
+                if semantic_matched_ranges:
+                    word_start = query_lower.find(word)
+                    if word_start >= 0:
+                        in_range = False
+                        for start, end in semantic_matched_ranges:
+                            if start <= word_start < end:
+                                in_range = True
+                                break
+                        if in_range:
+                            continue
+                
+                potential_terms.append(word)
+        
+        # Also try two-word phrases (bigrams) for things like "Sales NA", "Product Management"
+        words_list = query_lower.split()
+        for i in range(len(words_list) - 1):
+            w1, w2 = words_list[i], words_list[i + 1]
+            if w1 not in stop_words and w2 not in stop_words:
+                phrase = f"{w1} {w2}"
+                if phrase not in potential_terms:
+                    potential_terms.append(phrase)
+        
+        # Try three-word phrases for things like "GPS North America"
+        for i in range(len(words_list) - 2):
+            w1, w2, w3 = words_list[i], words_list[i + 1], words_list[i + 2]
+            if w1 not in stop_words and w3 not in stop_words:
+                phrase = f"{w1} {w2} {w3}"
+                if phrase not in potential_terms:
+                    potential_terms.append(phrase)
+        
+        return potential_terms
     
     def _normalize_department(self, dept: str) -> Optional[str]:
         """

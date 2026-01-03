@@ -45,6 +45,26 @@ from config.settings import NetSuiteConfig, get_config
 if TYPE_CHECKING:
     from src.core.query_parser import ParsedQuery
 
+# Dynamic registry import (lazy to avoid circular dependency)
+try:
+    from src.core.dynamic_registry import get_dynamic_registry
+    DYNAMIC_REGISTRY_AVAILABLE = True
+except ImportError:
+    DYNAMIC_REGISTRY_AVAILABLE = False
+    logger.warning("Dynamic registry not available")
+
+# Filter builder import
+try:
+    from src.core.netsuite_filter_builder import (
+        NetSuiteFilterBuilder,
+        NetSuiteFilterParams,
+        get_filter_builder,
+    )
+    FILTER_BUILDER_AVAILABLE = True
+except ImportError:
+    FILTER_BUILDER_AVAILABLE = False
+    logger.warning("Filter builder not available")
+
 @dataclass
 class SavedSearchResult:
     """Container for saved search results with metadata."""
@@ -129,6 +149,7 @@ class NetSuiteRESTClient:
         self.config = config
         self.base_url = f"https://{config.account_id}.suitetalk.api.netsuite.com"
         self.restlet_url = config.restlet_url
+        self.filter_builder = get_filter_builder() if FILTER_BUILDER_AVAILABLE else None
     
     def _get_auth_headers(self, method: str, url: str) -> Dict[str, str]:
         """Generate OAuth 1.0 headers for NetSuite TBA."""
@@ -199,50 +220,62 @@ class NetSuiteRESTClient:
         use_suiteql_optimization: bool = False,
     ) -> SavedSearchResult:
         """
-        Execute a saved search and return results via RESTlet.
+        Execute a saved search via RESTlet with intelligent filtering.
         
-        Note: SuiteQL optimization has been removed due to accuracy issues
-        (SuiteQL uses transaction date instead of posting period). All queries
-        now use RESTlet for accurate financial reporting.
+        Uses server-side filtering when:
+        1. parsed_query is provided AND has filterable criteria
+        2. Dynamic Registry is valid (not stale, not empty)
         
-        Args:
-            search_id: The internal ID of the saved search. 
-                      If None, uses the configured default.
-            parsed_query: Optional ParsedQuery (used for caching, filters applied in Python)
-            use_suiteql_optimization: Deprecated - ignored (always uses RESTlet)
-        
-        Returns:
-            SavedSearchResult with data and metadata.
+        Falls back to unfiltered fetch (which builds registry) when:
+        1. Registry needs refresh
+        2. No parsed_query provided
         """
         search_id = search_id or self.config.saved_search_id
         start_time = datetime.utcnow()
         
-        # Always use RESTlet for accurate financial data (posting period dates)
-        # SuiteQL optimization removed due to accuracy issues (uses transaction date, not posting period)
-        if self.restlet_url:
-            if not search_id:
-                raise ValueError("No saved search ID provided or configured")
-            
-            # Use parallel version if available and enabled
-            use_parallel = os.getenv("NETSUITE_PARALLEL_FETCH", "true").lower() == "true"
-            
-            if use_parallel and AIOHTTP_AVAILABLE:
-                logger.info(f"Executing saved search via RESTlet (parallel): {search_id}")
-                return self._execute_via_restlet_parallel(search_id, start_time)
-            else:
-                logger.info(f"Executing saved search via RESTlet (sequential): {search_id}")
-                return self._execute_via_restlet(search_id, start_time)
+        if not self.restlet_url:
+            raise DataRetrievalError("RESTlet not configured")
         
-        # RESTlet is required for accurate financial reporting
-        logger.error(
-            f"RESTlet URL not configured. Cannot execute saved search '{search_id}'. "
-            f"Please deploy the saved_search_restlet.js script and set NETSUITE_RESTLET_URL in .env"
-        )
-        raise DataRetrievalError(
-            f"Cannot execute saved search '{search_id}' - RESTlet not configured. "
-            f"Please deploy the RESTlet script (see netsuite_scripts/saved_search_restlet.js) "
-            f"and add NETSUITE_RESTLET_URL to your .env file."
-        )
+        if not search_id:
+            raise ValueError("No saved search ID provided")
+        
+        # DECISION: Should we use server-side filtering?
+        registry = get_dynamic_registry()
+        use_filtering = False
+        filter_params = None
+        
+        if registry.needs_refresh() or registry.is_empty():
+            # Registry needs data - do UNFILTERED fetch
+            logger.info("Registry needs refresh - using unfiltered fetch to rebuild")
+            use_filtering = False
+        elif parsed_query and self.filter_builder:
+            # Registry is valid - safe to use filtering
+            filter_params = self.filter_builder.build_from_parsed_query(parsed_query)
+            use_filtering = filter_params.has_filters()
+            if use_filtering:
+                logger.info(f"Using server-side filtering: {filter_params.describe()}")
+            else:
+                logger.info("No filterable criteria in query - using unfiltered fetch")
+        else:
+            logger.info("No parsed_query provided - using unfiltered fetch")
+        
+        # Execute fetch with or without filters
+        use_parallel = os.getenv("NETSUITE_PARALLEL_FETCH", "true").lower() == "true"
+        
+        if use_parallel and AIOHTTP_AVAILABLE:
+            result = self._execute_via_restlet_parallel_filtered(
+                search_id, start_time, filter_params if use_filtering else None
+            )
+        else:
+            result = self._execute_via_restlet_filtered(
+                search_id, start_time, filter_params if use_filtering else None
+            )
+        
+        # Update registry from UNFILTERED fetches only
+        if not use_filtering:
+            self._update_registry_from_data(result.data)
+        
+        return result
     
     def _execute_via_restlet(self, search_id: str, start_time: datetime) -> SavedSearchResult:
         """
@@ -334,6 +367,204 @@ class NetSuiteRESTClient:
             column_names=column_names,
             execution_time_ms=execution_time,
         )
+    
+    def _execute_via_restlet_filtered(
+        self,
+        search_id: str,
+        start_time: datetime,
+        filter_params: Optional['NetSuiteFilterParams'] = None,
+    ) -> SavedSearchResult:
+        """Execute saved search with optional server-side filtering (sequential)."""
+        from urllib.parse import urlparse, parse_qs
+        
+        parsed = urlparse(self.restlet_url)
+        base_restlet_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        existing_params = parse_qs(parsed.query)
+        
+        query_params = {k: v[0] if isinstance(v, list) else v for k, v in existing_params.items()}
+        query_params["searchId"] = search_id
+        query_params["pageSize"] = os.getenv("NETSUITE_PAGE_SIZE", "1000")
+        
+        # Add filter parameters if provided
+        if filter_params:
+            query_params.update(filter_params.to_query_params())
+            logger.debug(f"Filter params: {filter_params.to_query_params()}")
+        
+        all_results = []
+        current_page = 0
+        total_pages = 1
+        columns = []
+        
+        while current_page < total_pages:
+            query_params["page"] = str(current_page)
+            
+            headers = self._get_auth_headers_for_restlet("GET", base_restlet_url, query_params)
+            query_string = "&".join(
+                f"{k}={requests.utils.quote(str(v))}" 
+                for k, v in query_params.items()
+            )
+            full_url = f"{base_restlet_url}?{query_string}"
+            
+            logger.info(f"Fetching page {current_page + 1}/{total_pages}...")
+            response = requests.get(full_url, headers=headers, timeout=120)
+            
+            if response.status_code != 200:
+                logger.error(f"RESTlet error: {response.status_code} - {response.text[:500]}")
+                raise DataRetrievalError(f"RESTlet returned {response.status_code}")
+            
+            result = response.json()
+            
+            if not result.get("success"):
+                raise DataRetrievalError(f"RESTlet error: {result.get('error')}")
+            
+            if current_page == 0:
+                columns = result.get("columns", [])
+                total_pages = result.get("totalPages", 1)
+                total_results = result.get("totalResults", 0)
+                filters_applied = result.get("filtersApplied", 0)
+                
+                logger.info(
+                    f"Query results: {total_results:,} rows, {total_pages} pages"
+                    f"{f', {filters_applied} server-side filters applied' if filters_applied else ''}"
+                )
+            
+            page_results = result.get("results", [])
+            all_results.extend(page_results)
+            current_page += 1
+        
+        column_names = [col.get("name") or col.get("label") for col in columns]
+        if all_results and not column_names:
+            column_names = [k for k in all_results[0].keys() if not k.startswith("_")]
+        
+        execution_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+        
+        logger.info(f"Retrieved {len(all_results):,} rows in {execution_time/1000:.1f}s")
+        
+        return SavedSearchResult(
+            data=all_results,
+            search_id=search_id,
+            retrieved_at=datetime.utcnow(),
+            row_count=len(all_results),
+            column_names=column_names,
+            execution_time_ms=execution_time,
+        )
+    
+    def _execute_via_restlet_parallel_filtered(
+        self,
+        search_id: str,
+        start_time: datetime,
+        filter_params: Optional['NetSuiteFilterParams'] = None,
+    ) -> SavedSearchResult:
+        """Execute saved search with optional server-side filtering (parallel)."""
+        from urllib.parse import urlparse, parse_qs
+        
+        parsed = urlparse(self.restlet_url)
+        base_restlet_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        existing_params = parse_qs(parsed.query)
+        
+        page_size = os.getenv("NETSUITE_PAGE_SIZE", "1000")
+        
+        query_params = {k: v[0] if isinstance(v, list) else v for k, v in existing_params.items()}
+        query_params["searchId"] = search_id
+        query_params["pageSize"] = page_size
+        
+        # Add filter parameters if provided
+        if filter_params:
+            query_params.update(filter_params.to_query_params())
+            logger.debug(f"Filter params: {filter_params.to_query_params()}")
+        
+        # Fetch first page for metadata
+        query_params["page"] = "0"
+        headers = self._get_auth_headers_for_restlet("GET", base_restlet_url, query_params)
+        query_string = "&".join(
+            f"{k}={requests.utils.quote(str(v))}" 
+            for k, v in query_params.items()
+        )
+        full_url = f"{base_restlet_url}?{query_string}"
+        
+        logger.info("Fetching first page for metadata...")
+        response = requests.get(full_url, headers=headers, timeout=120)
+        
+        if response.status_code != 200:
+            raise DataRetrievalError(f"RESTlet returned {response.status_code}")
+        
+        first_result = response.json()
+        
+        if not first_result.get("success"):
+            raise DataRetrievalError(f"RESTlet error: {first_result.get('error')}")
+        
+        columns = first_result.get("columns", [])
+        total_pages = first_result.get("totalPages", 1)
+        total_results = first_result.get("totalResults", 0)
+        first_page_results = first_result.get("results", [])
+        filters_applied = first_result.get("filtersApplied", 0)
+        
+        logger.info(
+            f"Query results: {total_results:,} rows, {total_pages} pages"
+            f"{f', {filters_applied} server-side filters applied' if filters_applied else ''}"
+        )
+        
+        # Remove page param for parallel fetch
+        del query_params["page"]
+        
+        if total_pages <= 1:
+            all_results = first_page_results
+        elif self._should_use_parallel_fetch(total_pages):
+            logger.info(f"Using parallel fetch for {total_pages} pages")
+            
+            try:
+                loop = asyncio.get_running_loop()
+                logger.info("Existing event loop, falling back to sequential")
+                return self._execute_via_restlet_filtered(search_id, start_time, filter_params)
+            except RuntimeError:
+                pass
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                all_results = loop.run_until_complete(
+                    self._fetch_all_pages_parallel(
+                        base_restlet_url, query_params, total_pages, first_page_results
+                    )
+                )
+            finally:
+                loop.close()
+                asyncio.set_event_loop(None)
+        else:
+            logger.info(f"Using sequential fetch for {total_pages} pages (below parallel threshold)")
+            return self._execute_via_restlet_filtered(search_id, start_time, filter_params)
+        
+        column_names = [col.get("name") or col.get("label") for col in columns]
+        if all_results and not column_names:
+            column_names = [k for k in all_results[0].keys() if not k.startswith("_")]
+        
+        execution_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+        pages_per_second = total_pages / (execution_time / 1000) if execution_time > 0 else 0
+        
+        logger.info(
+            f"Retrieved {len(all_results):,} rows in {execution_time/1000:.1f}s "
+            f"({pages_per_second:.1f} pages/sec)"
+        )
+        
+        return SavedSearchResult(
+            data=all_results,
+            search_id=search_id,
+            retrieved_at=datetime.utcnow(),
+            row_count=len(all_results),
+            column_names=column_names,
+            execution_time_ms=execution_time,
+        )
+    
+    def _update_registry_from_data(self, data: List[Dict]):
+        """Update dynamic registry from fetched data."""
+        try:
+            registry = get_dynamic_registry()
+            if registry.needs_refresh() and data:
+                logger.info("Updating dynamic registry from fetched data...")
+                registry.build_from_data(data, force_rebuild=False)
+                logger.info(f"Registry updated: {registry.stats}")
+        except Exception as e:
+            logger.warning(f"Failed to update registry: {e}")
     
     def _get_auth_headers_for_restlet(self, method: str, url: str, query_params: dict = None) -> Dict[str, str]:
         """Generate OAuth 1.0 headers for RESTlet calls, including query params in signature."""
@@ -633,8 +864,13 @@ class NetSuiteRESTClient:
                     try:
                         loop = asyncio.get_running_loop()
                         # If we're in an existing loop, we can't use run_until_complete
-                        # Fall back to sequential
-                        logger.info("Existing event loop detected, using sequential fetch")
+                        # However, we can still use parallel fetch by creating a new thread
+                        # with its own event loop, or fall back to sequential
+                        logger.warning(
+                            f"Existing event loop detected. Parallel fetch requires a new event loop. "
+                            f"Falling back to sequential fetch for {total_pages} pages. "
+                            f"This may take longer - consider running outside asyncio.run() for faster parallel fetching."
+                        )
                         return self._execute_via_restlet(search_id, start_time)
                     except RuntimeError:
                         # No running loop - safe to create one
@@ -1062,10 +1298,11 @@ class NetSuiteDataRetriever:
     - Query-aware caching based on filter parameters
     """
     
-    def __init__(self, config: Optional[NetSuiteConfig] = None, use_cache: bool = True):
+    def __init__(self, config: Optional[NetSuiteConfig] = None, use_cache: bool = True, update_registry: bool = True):
         self.config = config or get_config().netsuite
         self.client = NetSuiteRESTClient(self.config)
         self.cache = DataCache() if use_cache else None
+        self._update_registry = update_registry  # Flag to control registry updates
     
     def get_saved_search_data(
         self, 
@@ -1114,6 +1351,10 @@ class NetSuiteDataRetriever:
         
         # Validate result
         self._validate_result(result)
+        
+        # NEW: Update dynamic registry if enabled and we have data
+        if self._update_registry and result.data:
+            self._maybe_update_registry(result.data)
         
         # Cache result
         if self.cache:
@@ -1209,6 +1450,69 @@ class NetSuiteDataRetriever:
             summary["numeric_stats"] = numeric_stats
         
         return summary
+    
+    def _maybe_update_registry(self, data: List[Dict]):
+        """
+        Update the dynamic registry from fetched data if needed.
+        
+        This piggybacks on existing data retrieval - no extra API calls.
+        Registry is only rebuilt if cache is stale (default: 24 hours).
+        
+        Args:
+            data: The data rows just fetched from NetSuite
+        """
+        if not DYNAMIC_REGISTRY_AVAILABLE:
+            return
+        
+        try:
+            registry = get_dynamic_registry()
+            
+            if registry.needs_refresh():
+                logger.info("Dynamic registry needs refresh, updating from fetched data...")
+                
+                # Build field mappings using our field detection logic
+                field_mappings = {
+                    "department": self._find_field_name(data, "department"),
+                    "account": self._find_field_name(data, "account"),
+                    "account_number": self._find_field_name(data, "account_number"),
+                    "subsidiary": self._find_field_name(data, "subsidiary"),
+                    "transaction_type": self._find_field_name(data, "type"),
+                }
+                
+                # Filter out None mappings
+                field_mappings = {k: v for k, v in field_mappings.items() if v}
+                
+                registry.build_from_data(data, field_mappings)
+                logger.info(f"Dynamic registry updated: {registry.stats}")
+            else:
+                logger.debug("Dynamic registry cache is valid, skipping update")
+                
+        except Exception as e:
+            # Don't fail the data retrieval if registry update fails
+            logger.warning(f"Failed to update dynamic registry: {e}")
+    
+    def _find_field_name(self, data: List[Dict], field_type: str) -> Optional[str]:
+        """Find actual field name in data for a given field type."""
+        if not data:
+            return None
+        
+        sample = data[0]
+        keys_lower = {k.lower(): k for k in sample.keys()}
+        
+        # Field type to candidate names mapping
+        candidates = {
+            "department": ["department_name", "department", "dept_name", "dept"],
+            "account": ["account_name", "account", "acctname", "acct_name"],
+            "account_number": ["account_number", "acctnumber", "acct_number", "acctno"],
+            "subsidiary": ["subsidiarynohierarchy", "subsidiary", "subsidiary_name", "entity"],
+            "type": ["type", "trantype", "transaction_type", "type_text"],
+        }
+        
+        for candidate in candidates.get(field_type, [field_type]):
+            if candidate.lower() in keys_lower:
+                return keys_lower[candidate.lower()]
+        
+        return None
 
 # Custom exceptions
 class AuthenticationError(Exception):
@@ -1220,6 +1524,6 @@ class DataRetrievalError(Exception):
     pass
 
 # Factory function
-def get_data_retriever(use_cache: bool = True) -> NetSuiteDataRetriever:
+def get_data_retriever(use_cache: bool = True, update_registry: bool = True) -> NetSuiteDataRetriever:
     """Factory function to get a configured data retriever."""
-    return NetSuiteDataRetriever(use_cache=use_cache)
+    return NetSuiteDataRetriever(use_cache=use_cache, update_registry=update_registry)

@@ -131,6 +131,83 @@ def cmd_test(args):
     print(f"\n  Average Score: {avg_score:.1f}/10")
     print(f"  Suggestions: {suggestions[:3]}")
 
+def cmd_refresh_registry(args):
+    """Refresh the dynamic semantic registry from NetSuite data."""
+    try:
+        from src.core.dynamic_registry import get_dynamic_registry
+        from src.tools.netsuite_client import get_data_retriever
+        
+        logger.info("Fetching data from NetSuite to refresh registry...")
+        logger.info("(This may take several minutes for large datasets)")
+        
+        retriever = get_data_retriever(update_registry=False)  # Don't auto-update during refresh
+        result = retriever.get_saved_search_data()
+        
+        logger.info(f"Retrieved {len(result.data):,} rows")
+        logger.info("Building dynamic registry...")
+        
+        registry = get_dynamic_registry()
+        registry.build_from_data(result.data, force_rebuild=args.force if hasattr(args, 'force') else False)
+        
+        print("\n" + "="*60)
+        print("REGISTRY STATISTICS")
+        print("="*60)
+        stats = registry.stats
+        print(f"  Departments:       {stats['departments']:,}")
+        print(f"  Accounts:          {stats['accounts']:,}")
+        print(f"  Account Numbers:   {stats['account_numbers']:,}")
+        print(f"  Subsidiaries:      {stats['subsidiaries']:,}")
+        print(f"  Transaction Types: {stats['transaction_types']:,}")
+        print(f"  Index Terms:       {stats['index_terms']:,}")
+        print(f"  Source Rows:       {stats['source_rows']:,}")
+        print(f"  Built At:          {stats['built_at']}")
+        print(f"  Cache Valid:       {stats['cache_valid']}")
+        print("\nRegistry refresh complete!")
+        
+    except ImportError:
+        logger.error("Dynamic registry not available. Ensure src/core/dynamic_registry.py exists.")
+    except Exception as e:
+        logger.error(f"Failed to refresh registry: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def cmd_registry_stats(args):
+    """Show dynamic registry statistics."""
+    try:
+        from src.core.dynamic_registry import get_dynamic_registry
+        
+        registry = get_dynamic_registry()
+        stats = registry.stats
+        
+        print("\n" + "="*60)
+        print("DYNAMIC REGISTRY STATISTICS")
+        print("="*60)
+        print(f"  Departments:       {stats['departments']:,}")
+        print(f"  Accounts:          {stats['accounts']:,}")
+        print(f"  Account Numbers:   {stats['account_numbers']:,}")
+        print(f"  Subsidiaries:      {stats['subsidiaries']:,}")
+        print(f"  Transaction Types: {stats['transaction_types']:,}")
+        print(f"  Index Terms:       {stats['index_terms']:,}")
+        print(f"  Source Rows:       {stats['source_rows']:,}")
+        print(f"  Built At:          {stats['built_at']}")
+        print(f"  Cache Valid:       {stats['cache_valid']}")
+        print("="*60)
+        
+        if registry.is_empty():
+            print("\nRegistry is empty. Run 'python main.py refresh-registry' to build it.")
+        elif registry.needs_refresh():
+            print("\nRegistry needs refresh. Run 'python main.py refresh-registry' to update it.")
+        else:
+            print("\nRegistry is up to date.")
+            
+    except ImportError:
+        logger.error("Dynamic registry not available. Ensure src/core/dynamic_registry.py exists.")
+    except Exception as e:
+        logger.error(f"Error getting registry stats: {e}", exc_info=True)
+        print(f"\nError: {e}")
+
+
 def cmd_setup(args):
     """Validate configuration and setup."""
     from config.settings import get_config, MODEL_REGISTRY
@@ -313,6 +390,15 @@ Environment Variables:
     # Setup command
     setup_parser = subparsers.add_parser('setup', help='Validate setup')
     setup_parser.set_defaults(func=cmd_setup)
+    
+    # Refresh registry command
+    refresh_parser = subparsers.add_parser('refresh-registry', help='Refresh the dynamic semantic registry from NetSuite data')
+    refresh_parser.add_argument('--force', action='store_true', help='Force refresh even if cache is valid')
+    refresh_parser.set_defaults(func=cmd_refresh_registry)
+    
+    # Registry stats command
+    stats_parser = subparsers.add_parser('registry-stats', help='Show dynamic registry statistics')
+    stats_parser.set_defaults(func=cmd_registry_stats)
     
     # Interactive command
     interactive_parser = subparsers.add_parser('interactive', help='Interactive chat mode')

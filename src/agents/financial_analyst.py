@@ -641,7 +641,7 @@ Remember: Use the pre-calculated metrics exactly as provided - do not recalculat
             
             sorted_cats = sorted(category_totals.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
             
-            if sorted_cats:
+            if sorted_cats and self.chart_generator:
                 chart = self.chart_generator.bar_chart(
                     categories=[c[0] for c in sorted_cats],
                     values=[c[1] for c in sorted_cats],
@@ -668,7 +668,7 @@ Remember: Use the pre-calculated metrics exactly as provided - do not recalculat
                     amt = float(row.get(amount_field, 0) or 0)
                     date_totals[date_val] = date_totals.get(date_val, 0) + amt
             
-            if len(date_totals) >= 3:
+            if len(date_totals) >= 3 and self.chart_generator:
                 sorted_dates = sorted(date_totals.items())
                 chart = self.chart_generator.line_chart(
                     x_values=[d[0] for d in sorted_dates],

@@ -91,6 +91,31 @@ class SemanticTerm:
 # =============================================================================
 # This is the central mapping of financial terms to their technical filters.
 # Each entry maps a natural language term to its proper interpretation.
+#
+# =============================================================================
+# CORE FINANCIAL SEMANTICS (STATIC)
+# =============================================================================
+# These mappings represent fundamental accounting concepts that NEVER change:
+# - Account type prefixes (revenue = 4, expenses = 5-8, etc.)
+# - Financial statement classifications
+# - Core accounting terms
+#
+# IMPORTANT: Department names, account names, and subsidiary names should NOT
+# be hardcoded here. They are dynamically discovered by the DynamicRegistry
+# from actual NetSuite data. This ensures the system stays up-to-date when
+# organizational structures change.
+#
+# What SHOULD be here:
+# - "revenue" -> account prefix "4"
+# - "expenses" -> account prefix "5,6,7,8"
+# - "cogs" -> account prefix "51"
+# - etc.
+#
+# What should NOT be here:
+# - "marketing" -> department filter (handled by DynamicRegistry)
+# - "GPS" -> department filter (handled by DynamicRegistry)
+# - "Phenom People Inc" -> subsidiary filter (handled by DynamicRegistry)
+# =============================================================================
 
 FINANCIAL_SEMANTICS: Dict[str, SemanticTerm] = {
     # -------------------------------------------------------------------------
@@ -645,7 +670,14 @@ FINANCIAL_SEMANTICS: Dict[str, SemanticTerm] = {
     ),
     
     # -------------------------------------------------------------------------
-    # DEPARTMENT-BASED TERMS (filter on department name)
+    # DEPARTMENT-BASED TERMS (DEPRECATED - Use DynamicRegistry)
+    # -------------------------------------------------------------------------
+    # NOTE: These static department mappings are deprecated and will be removed
+    # in a future version. The DynamicRegistry now handles department resolution
+    # automatically from NetSuite data.
+    #
+    # These are kept temporarily for backward compatibility but the DynamicRegistry
+    # takes precedence when available.
     # -------------------------------------------------------------------------
     
     "sales department": SemanticTerm(
