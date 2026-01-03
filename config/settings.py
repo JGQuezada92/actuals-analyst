@@ -55,10 +55,11 @@ MODEL_REGISTRY: Dict[str, ModelConfig] = {
 }
 
 # Cross-model evaluation mapping (generate with X, judge with Y)
+# Note: Using same model for evaluation when only one API key is available
 JUDGE_MODEL_MAP = {
-    ModelProvider.GEMINI: "claude-sonnet-4",
+    ModelProvider.GEMINI: "gemini-2.0-flash",
     ModelProvider.CLAUDE: "gemini-2.0-flash",
-    ModelProvider.OPENAI: "claude-sonnet-4",
+    ModelProvider.OPENAI: "gemini-2.0-flash",
 }
 
 @dataclass
@@ -70,6 +71,7 @@ class NetSuiteConfig:
     token_id: str = field(default_factory=lambda: os.getenv("NETSUITE_TOKEN_ID", ""))
     token_secret: str = field(default_factory=lambda: os.getenv("NETSUITE_TOKEN_SECRET", ""))
     saved_search_id: str = field(default_factory=lambda: os.getenv("NETSUITE_SAVED_SEARCH_ID", ""))
+    restlet_url: str = field(default_factory=lambda: os.getenv("NETSUITE_RESTLET_URL", ""))
     
     # OneLogin SSO Configuration
     onelogin_client_id: str = field(default_factory=lambda: os.getenv("ONELOGIN_CLIENT_ID", ""))
@@ -82,6 +84,15 @@ class SlackConfig:
     bot_token: str = field(default_factory=lambda: os.getenv("SLACK_BOT_TOKEN", ""))
     signing_secret: str = field(default_factory=lambda: os.getenv("SLACK_SIGNING_SECRET", ""))
     app_token: str = field(default_factory=lambda: os.getenv("SLACK_APP_TOKEN", ""))
+
+@dataclass
+class FiscalConfig:
+    """Fiscal calendar configuration."""
+    # Fiscal year start month (1-12). February = 2.
+    # FY2025 with month=2 means Feb 1, 2025 - Jan 31, 2026
+    fiscal_year_start_month: int = field(
+        default_factory=lambda: int(os.getenv("FISCAL_YEAR_START_MONTH", "2"))
+    )
 
 @dataclass 
 class EvaluationConfig:
@@ -109,6 +120,7 @@ class AppConfig:
     netsuite: NetSuiteConfig = field(default_factory=NetSuiteConfig)
     slack: SlackConfig = field(default_factory=SlackConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+    fiscal: FiscalConfig = field(default_factory=FiscalConfig)
     
     # Logging
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))

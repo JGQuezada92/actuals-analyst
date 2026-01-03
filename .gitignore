@@ -41,3 +41,13 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Test Data Files (may contain sensitive information)
+*.xls
+*.xlsx
+PlanfulTestTransactionDetailJGQResults547.xls
+
+# Validation output files
+ground_truth_*.json
+agent_result_*.json
+validation_output.log

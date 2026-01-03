@@ -142,7 +142,7 @@ def cmd_setup(args):
     config = get_config()
     
     # Check active model
-    print(f"\n📊 Active Model: {config.active_model}")
+    print(f"\n[Model] Active Model: {config.active_model}")
     try:
         model_config = config.model_config
         print(f"   Provider: {model_config.provider.value}")
@@ -151,13 +151,13 @@ def cmd_setup(args):
         # Check API key
         api_key_var = model_config.api_key_env
         has_key = bool(os.getenv(api_key_var))
-        status = "✅" if has_key else "❌"
+        status = "[OK]" if has_key else "[MISSING]"
         print(f"   {status} API Key ({api_key_var}): {'Set' if has_key else 'MISSING'}")
     except Exception as e:
-        print(f"   ❌ Error: {e}")
+        print(f"   [ERROR] Error: {e}")
     
     # Check NetSuite config
-    print(f"\n📦 NetSuite Configuration:")
+    print(f"\n[NetSuite] Configuration:")
     ns = config.netsuite
     checks = [
         ("Account ID", ns.account_id),
@@ -165,11 +165,15 @@ def cmd_setup(args):
         ("Saved Search ID", ns.saved_search_id),
     ]
     for name, value in checks:
-        status = "✅" if value else "❌"
+        status = "[OK]" if value else "[MISSING]"
         print(f"   {status} {name}: {'Set' if value else 'MISSING'}")
     
+    # Check Fiscal config
+    print(f"\n[Fiscal] Calendar Configuration:")
+    print(f"   Fiscal Year Start Month: {config.fiscal.fiscal_year_start_month}")
+    
     # Check Slack config
-    print(f"\n💬 Slack Configuration:")
+    print(f"\n[Slack] Configuration:")
     slack = config.slack
     checks = [
         ("Bot Token", slack.bot_token),
@@ -177,18 +181,93 @@ def cmd_setup(args):
         ("App Token", slack.app_token),
     ]
     for name, value in checks:
-        status = "✅" if value else "❌"
+        status = "[OK]" if value else "[MISSING]"
         print(f"   {status} {name}: {'Set' if value else 'MISSING'}")
     
     # Available models
-    print(f"\n🤖 Available Models:")
+    print(f"\n[Models] Available Models:")
     for name in MODEL_REGISTRY:
-        marker = "→" if name == config.active_model else " "
+        marker = "->" if name == config.active_model else "  "
         print(f"   {marker} {name}")
     
     print("\n" + "="*60)
     print("To switch models, set: ACTIVE_MODEL=<model-name>")
     print("="*60)
+
+def cmd_interactive(args):
+    """Start interactive chat mode with conversation memory."""
+    import asyncio
+    from src.agents.financial_analyst import get_financial_analyst
+    from src.core.memory import get_session_manager
+    
+    print("\n" + "="*60)
+    print("INTERACTIVE FINANCIAL ANALYST")
+    print("="*60)
+    print("Ask questions about your NetSuite data.")
+    print("The agent remembers context from previous questions.")
+    print("Type 'quit' or 'exit' to end, 'clear' to reset context.")
+    print("="*60 + "\n")
+    
+    agent = get_financial_analyst()
+    session_manager = get_session_manager()
+    session = session_manager.create_session()
+    
+    while True:
+        try:
+            query = input("\nYou: ").strip()
+            
+            if not query:
+                continue
+            
+            if query.lower() in ['quit', 'exit', 'q']:
+                print("\nGoodbye!")
+                break
+            
+            if query.lower() == 'clear':
+                session = session_manager.create_session()
+                print("\n[Context cleared. Starting fresh conversation.]")
+                continue
+            
+            if query.lower() == 'context':
+                if session.context.has_context():
+                    print(f"\n[Current Context]\n{session.context.to_prompt_context()}")
+                else:
+                    print("\n[No context accumulated yet.]")
+                continue
+            
+            print("\nAnalyzing... (this may take a moment)")
+            
+            response = asyncio.run(agent.analyze(
+                query=query,
+                include_charts=not args.no_charts,
+                max_iterations=args.iterations,
+                session=session,
+            ))
+            
+            print("\n" + "-"*60)
+            print("ANALYSIS")
+            print("-"*60)
+            print(response.analysis)
+            
+            if response.calculations:
+                print("\n" + "-"*40)
+                print("KEY METRICS")
+                print("-"*40)
+                for calc in response.calculations[:5]:
+                    print(f"  {calc['metric_name']}: {calc['formatted_value']}")
+            
+            if response.charts:
+                print(f"\n[{len(response.charts)} chart(s) generated]")
+            
+            # Show session info
+            print(f"\n[Session: {session.session_id[:8]}... | Turns: {len(session.turns)}]")
+            
+        except KeyboardInterrupt:
+            print("\n\nGoodbye!")
+            break
+        except Exception as e:
+            logger.error(f"Error: {e}", exc_info=True)
+            print(f"\n[Error: {e}]")
 
 def main():
     setup_environment()
@@ -199,14 +278,16 @@ def main():
         epilog="""
 Examples:
   python main.py slack                    Start the Slack bot
-  python main.py analyze "Show revenue"   Run an analysis
+  python main.py analyze "Show revenue"   Run a one-off analysis
+  python main.py interactive              Start interactive chat mode
   python main.py setup                    Check configuration
   
 Environment Variables:
-  ACTIVE_MODEL          LLM to use (default: gemini-2.0-flash)
-  GEMINI_API_KEY        Google AI API key
+  ACTIVE_MODEL              LLM to use (default: gemini-2.0-flash)
+  GEMINI_API_KEY            Google AI API key
   NETSUITE_SAVED_SEARCH_ID  Your saved search ID
-  SLACK_BOT_TOKEN       Slack bot token
+  FISCAL_YEAR_START_MONTH   Fiscal year start month (1-12, default: 2)
+  SLACK_BOT_TOKEN           Slack bot token
         """
     )
     
@@ -232,6 +313,14 @@ Environment Variables:
     # Setup command
     setup_parser = subparsers.add_parser('setup', help='Validate setup')
     setup_parser.set_defaults(func=cmd_setup)
+    
+    # Interactive command
+    interactive_parser = subparsers.add_parser('interactive', help='Interactive chat mode')
+    interactive_parser.add_argument('--no-charts', dest='no_charts', action='store_true',
+                                   help='Disable chart generation')
+    interactive_parser.add_argument('--iterations', type=int, default=2,
+                                   help='Max reflection iterations (default: 2)')
+    interactive_parser.set_defaults(func=cmd_interactive)
     
     args = parser.parse_args()
     

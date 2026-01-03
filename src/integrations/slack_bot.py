@@ -35,6 +35,7 @@ def get_slack_dependencies():
         )
 
 from src.agents.financial_analyst import FinancialAnalystAgent, AgentResponse, get_financial_analyst
+from src.core.memory import SessionManager, Session, get_session_manager
 from config.settings import SlackConfig, get_config
 
 class SlackBot:
@@ -52,9 +53,11 @@ class SlackBot:
         self,
         config: Optional[SlackConfig] = None,
         agent: Optional[FinancialAnalystAgent] = None,
+        session_manager: Optional[SessionManager] = None,
     ):
         self.config = config or get_config().slack
         self.agent = agent or get_financial_analyst()
+        self.session_manager = session_manager or get_session_manager()
         
         # Import Slack dependencies
         App, _, WebClient, self.SlackApiError = get_slack_dependencies()
@@ -140,13 +143,20 @@ class SlackBot:
             asyncio.run(self._run_analysis(query, channel_id, user_id))
     
     async def _run_analysis(self, query: str, channel_id: str, user_id: str):
-        """Run the analysis and post results to Slack."""
+        """Run the analysis and post results to Slack with conversation memory."""
         try:
-            # Run the agent
+            # Get or create session for this channel
+            session = self.session_manager.get_session_by_channel(
+                channel_id=channel_id,
+                user_id=user_id
+            )
+            
+            # Run the agent with session context
             response = await self.agent.analyze(
                 query=query,
                 include_charts=True,
                 max_iterations=3,
+                session=session,
             )
             
             # Post the analysis

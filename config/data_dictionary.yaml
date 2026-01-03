@@ -1,0 +1,238 @@
+# =============================================================================
+# NetSuite Data Dictionary
+# =============================================================================
+# This file defines how the agent should interpret and parse NetSuite data.
+# Edit this file to update parsing rules without changing code.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# DATE FIELDS
+# -----------------------------------------------------------------------------
+# Defines which date field to use for date-based queries and filtering
+date_fields:
+  # Primary date field - ALWAYS use this for date range queries
+  primary: "formuladate"
+  primary_display_name: "Month-End Date"
+  
+  # Fallback if primary is not available
+  fallback: "trandate"
+  fallback_display_name: "Transaction Date"
+  
+  # Date format in the data (for parsing)
+  format: "M/D/YYYY"
+  
+  # Period field for grouping by accounting period
+  period_field: "accountingPeriod_periodname"
+  period_display_name: "Accounting Period"
+
+# -----------------------------------------------------------------------------
+# DEPARTMENT HIERARCHY
+# -----------------------------------------------------------------------------
+# Defines how to parse department names which contain hierarchy information
+department_hierarchy:
+  # The field containing department data
+  field: "department_name"
+  
+  # Separator between hierarchy levels
+  separator: " : "
+  
+  # Structure of the hierarchy (left to right after split)
+  structure:
+    - name: "cost_category"
+      position: 0
+      description: "Cost center category (e.g., G&A, Cost of Sales, R&D)"
+      # Remove "(Parent)" suffix when extracting
+      cleanup_pattern: " \\(Parent\\)$"
+      
+    - name: "department"
+      position: 1
+      description: "Actual department name"
+  
+  # Known cost categories for validation and grouping
+  cost_categories:
+    - name: "G&A"
+      full_name: "General & Administrative"
+      description: "Administrative overhead costs"
+      
+    - name: "Cost of Sales"
+      full_name: "Cost of Sales"
+      description: "Direct costs related to delivering products/services"
+      
+    - name: "R&D"
+      full_name: "Research & Development"
+      description: "Product development and engineering costs"
+      
+    - name: "Sales & Marketing"
+      full_name: "Sales & Marketing"
+      description: "Revenue generation and marketing costs"
+  
+  # Example mappings for documentation
+  examples:
+    - raw: "G&A (Parent) : IT"
+      cost_category: "G&A"
+      department: "IT"
+      
+    - raw: "Cost of Sales (Parent) : GCC - Customer Centric Engineering"
+      cost_category: "Cost of Sales"
+      department: "GCC - Customer Centric Engineering"
+      
+    - raw: "R&D (Parent) : Engineering (Parent)"
+      cost_category: "R&D"
+      department: "Engineering"
+
+# -----------------------------------------------------------------------------
+# ACCOUNT CLASSIFICATION
+# -----------------------------------------------------------------------------
+# Defines how to classify accounts based on account number prefixes
+account_classification:
+  # Field containing the account number
+  number_field: "account_number"
+  name_field: "account_name"
+  
+  # Classification rules based on first digit(s) of account number
+  income_statement:
+    prefixes: ["4", "5", "6", "7", "8"]
+    description: "Revenue and expense accounts appearing on the Income Statement"
+    subcategories:
+      - prefix: "4"
+        name: "Revenue"
+        description: "Income from sales and services"
+      - prefix: "5"
+        name: "Operating Expenses"
+        description: "Operating expense accounts (parent category)"
+        # Two-digit subcategories within 5xxx
+        subcategories:
+          - prefix: "51"
+            name: "Cost of Goods Sold"
+            description: "Cost of Goods Sold/Cost of Sales"
+          - prefix: "52"
+            name: "R&D"
+            description: "R&D/Product Development"
+          - prefix: "53"
+            name: "Sales & Marketing"
+            description: "Sales & Marketing/S&M"
+          - prefix: "59"
+            name: "General & Administrative"
+            description: "General & Administrative/G&A"
+            # Three-digit subcategory within 59xxx
+            subcategories:
+              - prefix: "598"
+                name: "Depreciation & Amortization"
+                description: "Depreciation & Amortization (within G&A)"
+      - prefix: "6"
+        name: "Interest"
+        description: "Interest related accounts (expense or income)"
+      - prefix: "7"
+        name: "Income Tax & Other"
+        description: "Income Tax, Other Expense and Other Income"
+      - prefix: "8"
+        name: "Income Tax & Other"
+        description: "Income Tax, Other Expense and Other Income"
+        
+  balance_sheet:
+    prefixes: ["1", "2", "3"]
+    description: "Asset, liability, and equity accounts appearing on the Balance Sheet"
+    subcategories:
+      - prefix: "1"
+        name: "Assets"
+        description: "What the company owns"
+      - prefix: "2"
+        name: "Liabilities"
+        description: "What the company owes"
+      - prefix: "3"
+        name: "Equity"
+        description: "Owner's stake in the company"
+
+# -----------------------------------------------------------------------------
+# ACCOUNT NAME HIERARCHY
+# -----------------------------------------------------------------------------
+# Defines how to parse account names which contain hierarchy/category information
+account_hierarchy:
+  # Separator between hierarchy levels in account names
+  separator: " : "
+  
+  # The first segment (before first ":") indicates the cost category
+  first_segment_meaning: "cost_category"
+  
+  # Examples of account name parsing
+  examples:
+    - raw: "Sales & Marketing : Employee Costs: Sales & Marketing : Payroll Taxes: Sales & Marketing"
+      cost_category: "Sales & Marketing"
+      account_type: "Payroll Taxes"
+      statement: "Income Statement"
+      
+    - raw: "Purchase Tax Payables : Sales Tax Payable : Sales Tax Payable"
+      cost_category: "Purchase Tax Payables"
+      account_type: "Sales Tax Payable"
+      statement: "Balance Sheet (Liability)"
+      
+    - raw: "Accounts Payable : Accounts Payable A/P"
+      cost_category: "Accounts Payable"
+      account_type: "Accounts Payable A/P"
+      statement: "Balance Sheet (Liability)"
+
+# -----------------------------------------------------------------------------
+# AMOUNT FIELDS
+# -----------------------------------------------------------------------------
+# Defines the amount-related fields and their usage
+amount_fields:
+  # Primary amount field (net of debits and credits)
+  primary: "amount"
+  
+  # Debit amount (positive = debit entry)
+  debit: "debitamount"
+  
+  # Credit amount (positive = credit entry)
+  credit: "creditamount"
+  
+  # Sign convention
+  sign_convention:
+    expenses: "positive means expense increase"
+    revenue: "negative means revenue increase (credit)"
+    assets: "positive means asset increase (debit)"
+    liabilities: "negative means liability increase (credit)"
+
+# -----------------------------------------------------------------------------
+# ENTITY FIELDS
+# -----------------------------------------------------------------------------
+# Defines organization and entity-related fields
+entity_fields:
+  subsidiary: "subsidiarynohierarchy"
+  vendor: "vendor_entityid"
+  
+# -----------------------------------------------------------------------------
+# TRANSACTION FIELDS
+# -----------------------------------------------------------------------------
+# Defines transaction-related fields
+transaction_fields:
+  type_code: "type"
+  type_text: "type_text"
+  memo: "memo"
+  document_number: "tranid"
+  
+  # Common transaction types
+  transaction_types:
+    - code: "VendBill"
+      name: "Vendor Bill"
+      description: "Invoice from a vendor"
+    - code: "VendCred"
+      name: "Vendor Credit"
+      description: "Credit memo from a vendor"
+    - code: "Journal"
+      name: "Journal Entry"
+      description: "Manual accounting adjustment"
+    - code: "ExpRept"
+      name: "Expense Report"
+      description: "Employee expense reimbursement"
+
+# -----------------------------------------------------------------------------
+# FISCAL CALENDAR
+# -----------------------------------------------------------------------------
+# Defines fiscal year configuration
+fiscal_calendar:
+  # Month when fiscal year starts (1 = January, 2 = February, etc.)
+  start_month: 2
+  
+  # Description for users
+  description: "Fiscal year runs February through January (FY2025 = Feb 2025 - Jan 2026)"
+
