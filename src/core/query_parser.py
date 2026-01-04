@@ -517,6 +517,59 @@ class QueryParser:
         # IMPORTANT: Check specific quarter patterns FIRST before generic patterns
         # This ensures "Q1 in FY 2026" is parsed correctly, not as "FY 2026" + "Q1"
         
+        # Try month range pattern FIRST (e.g., "February through December 2025", "Feb to Dec 2025", "March - November 2025")
+        # Pattern: Month (through|to|-|–) Month Year
+        month_range_pattern = r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*(?:through|to|-|–)\s*(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*(\d{4})\b"
+        
+        month_range_match = re.search(month_range_pattern, query, re.IGNORECASE)
+        if month_range_match:
+            start_month_str = month_range_match.group(1)
+            end_month_str = month_range_match.group(2)
+            year = int(month_range_match.group(3))
+            
+            # Convert month names to numbers
+            month_map = {
+                'jan': 1, 'january': 1,
+                'feb': 2, 'february': 2,
+                'mar': 3, 'march': 3,
+                'apr': 4, 'april': 4,
+                'may': 5,
+                'jun': 6, 'june': 6,
+                'jul': 7, 'july': 7,
+                'aug': 8, 'august': 8,
+                'sep': 9, 'september': 9,
+                'oct': 10, 'october': 10,
+                'nov': 11, 'november': 11,
+                'dec': 12, 'december': 12,
+            }
+            
+            start_month = month_map.get(start_month_str.lower()[:3], 1)
+            end_month = month_map.get(end_month_str.lower()[:3], 12)
+            
+            # Create date range
+            from calendar import monthrange
+            start_date = date(year, start_month, 1)
+            _, last_day = monthrange(year, end_month)
+            end_date = date(year, end_month, last_day)
+            
+            # Determine fiscal year
+            fiscal_year = self.fiscal_calendar.get_fiscal_year_for_date(start_date)
+            
+            # Create period name
+            start_month_short = start_month_str[:3].title()
+            end_month_short = end_month_str[:3].title()
+            period_name = f"{start_month_short}-{end_month_short} {year}"
+            
+            result = FiscalPeriod(
+                start_date=start_date,
+                end_date=end_date,
+                period_name=period_name,
+                fiscal_year=fiscal_year,
+            )
+            
+            logger.info(f"Extracted time period: {result.period_name} ({result.start_date} to {result.end_date})")
+            return result
+        
         # Try specific quarter with fiscal year (e.g., "Q1 FY2026", "Q1 in FY 2026", "Q1 2026")
         # Pattern: Q1 (optional: "in") FY 2026 or Q1 FY2026 or Q1 2026
         q_match = re.search(r"\bQ([1-4])(?:\s+in\s+)?(?:FY\s*)?(\d{2,4})\b", query, re.IGNORECASE)
@@ -579,6 +632,8 @@ class QueryParser:
             num_months = int(months_match.group(1))
             return self.fiscal_calendar.get_trailing_months(num_months)
         
+        # Log if no time period was extracted
+        logger.warning(f"No time period extracted from query: {query[:100]}")
         return None
     
     def _extract_comparison(self, query: str, time_period: Optional[FiscalPeriod]) -> Tuple[Optional[ComparisonType], Optional[FiscalPeriod]]:

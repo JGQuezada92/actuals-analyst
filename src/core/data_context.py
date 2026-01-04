@@ -126,9 +126,9 @@ class DataContext:
         """Return fallback configuration if YAML can't be loaded."""
         return {
             "date_fields": {
-                "primary": "formuladate",
-                "fallback": "trandate",
-                "period_field": "accountingPeriod_periodname",
+                "period_field": "accountingPeriod_periodname",  # Primary for period filtering
+                "primary": "trandate",  # Fallback for date-range filtering
+                "fallback": "formuladate",
             },
             "department_hierarchy": {
                 "field": "department_name",
@@ -166,23 +166,40 @@ class DataContext:
     # =========================================================================
     
     def get_primary_date_field(self) -> str:
-        """Get the primary date field name to use for filtering."""
-        return self._config.get("date_fields", {}).get("primary", "formuladate")
+        """
+        Get the primary date field name to use for filtering.
+        
+        Note: For period-based filtering (matching export file), use get_period_field() instead.
+        This method returns the date field for date-range filtering (fallback only).
+        """
+        return self._config.get("date_fields", {}).get("primary", "trandate")
     
     def get_fallback_date_field(self) -> str:
         """Get the fallback date field if primary is not available."""
         return self._config.get("date_fields", {}).get("fallback", "trandate")
     
     def get_period_field(self) -> str:
-        """Get the accounting period field name."""
+        """
+        Get the accounting period field name for period-based filtering.
+        
+        This is the PRIMARY field for date filtering and matches the export file's
+        "Month-End Date (Text Format)" filter. Use this for filtering by period names
+        (e.g., "Jan 2024", "Feb 2024") rather than date ranges.
+        """
         return self._config.get("date_fields", {}).get("period_field", "accountingPeriod_periodname")
     
     def get_date_fields(self) -> List[str]:
-        """Get all date-related fields in order of preference."""
+        """
+        Get all date-related fields in order of preference.
+        
+        Note: For period-based filtering, use get_period_field() instead.
+        This method returns date fields for date-range filtering (fallback only).
+        """
         df = self._config.get("date_fields", {})
         return [
-            df.get("primary", "formuladate"),
-            df.get("fallback", "trandate"),
+            df.get("period_field", "accountingPeriod_periodname"),  # Primary for period filtering
+            df.get("primary", "trandate"),  # Fallback for date-range filtering
+            df.get("fallback", "formuladate"),
         ]
     
     # =========================================================================

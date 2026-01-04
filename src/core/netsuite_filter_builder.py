@@ -58,15 +58,22 @@ class NetSuiteFilterParams:
         """
         Convert to URL query parameters for the RESTlet.
         
+        NOTE: period_names are NOT sent to RESTlet because server-side period filtering
+        doesn't work reliably. Period filtering is applied client-side instead.
+        
         Returns:
             Dict of parameter name to value, ready for URL encoding
         """
         params = {}
         
-        # Prefer period names over date range
+        # DO NOT send period_names to RESTlet - server-side filtering doesn't work
+        # Period filtering will be applied client-side using accountingPeriod_periodname
+        # Only use date range as fallback if period_names not available
         if self.period_names:
-            params["periodNames"] = ",".join(self.period_names)
+            # Skip sending periodNames to RESTlet - will filter client-side
+            logger.debug(f"Skipping periodNames server-side filter (will filter client-side): {self.period_names}")
         elif self.start_date and self.end_date:
+            # Fallback: use date range if period names not available
             params["startDate"] = self.start_date
             params["endDate"] = self.end_date
             params["dateField"] = self.date_field

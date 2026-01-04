@@ -382,7 +382,7 @@ Remember: Use the pre-calculated metrics exactly as provided - do not recalculat
         data = context.raw_data.data
         filters_applied = []
         
-        # Apply time period filter (using formuladate - posting period)
+        # Apply time period filter using accountingPeriod_periodname (matches export file)
         if parsed.time_period:
             result = self.data_processor.filter_by_period(data, parsed.time_period)
             data = result.data

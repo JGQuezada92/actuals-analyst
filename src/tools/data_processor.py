@@ -78,10 +78,17 @@ class DataProcessor:
         "debit": ["debitamount", "debit", "dr"],
         "credit": ["creditamount", "credit", "cr"],
         
-        # Date fields - primary is month_end_date per data dictionary
-        "date": ["formuladate", "trandate", "date", "transaction_date", "tran_date", "postingdate"],
+        # Date fields - fallback fields for date-range filtering
+        "date": ["trandate", "formuladate", "date", "transaction_date", "tran_date", "postingdate"],
         "month_end_date": ["formuladate", "month_end_date"],
-        "period": ["accountingPeriod_periodname", "periodname", "period_name", "postingperiod"],
+        # Period field - PRIMARY for period-based filtering (matches export file)
+        "period": [
+            "accountingPeriod_periodname",      # Primary - matches export file
+            "accountingperiod_periodname",      # Lowercase variant
+            "periodname",                       # Simple variant
+            "period_name",                      # Underscore variant
+            "postingperiod",                     # Alternative naming
+        ],
         
         # Entity/Organization fields
         "subsidiary": ["subsidiarynohierarchy", "subsidiary", "subsidiary_name", "entity"],
@@ -111,7 +118,16 @@ class DataProcessor:
     
     def _update_field_aliases_from_context(self):
         """Update field aliases based on data context configuration."""
-        # Ensure the primary date field from config is first in the list
+        # Ensure the period field from config is first in the period list (PRIMARY for filtering)
+        period_field = self.data_context.get_period_field()
+        if period_field and "period" in self.FIELD_ALIASES:
+            if period_field not in self.FIELD_ALIASES["period"]:
+                self.FIELD_ALIASES["period"].insert(0, period_field)
+            elif self.FIELD_ALIASES["period"][0] != period_field:
+                self.FIELD_ALIASES["period"].remove(period_field)
+                self.FIELD_ALIASES["period"].insert(0, period_field)
+        
+        # Ensure the primary date field from config is first in the date list (fallback only)
         primary_date = self.data_context.get_primary_date_field()
         if primary_date and "date" in self.FIELD_ALIASES:
             if primary_date not in self.FIELD_ALIASES["date"]:
@@ -274,6 +290,9 @@ class DataProcessor:
         
         This matches the export file's "Month-End Date (Text Format)" filter
         by filtering on period names (e.g., "Jan 2024", "Feb 2024") rather than dates.
+        
+        This is the PRIMARY method for date filtering to ensure calculations match
+        the export file exactly.
         """
         # Try to filter by period name first (matches export file)
         period_field = field_name or self.find_field(data, "period")
@@ -293,6 +312,11 @@ class DataProcessor:
                     if row_period in period_names:
                         filtered.append(row)
                 
+                logger.info(
+                    f"Period filter: {len(data)} -> {len(filtered)} rows "
+                    f"({period_field} in {period_names[:3]}{'...' if len(period_names) > 3 else ''})"
+                )
+                
                 return FilterResult(
                     data=filtered,
                     original_count=len(data),
@@ -301,7 +325,7 @@ class DataProcessor:
                 )
         
         # Fallback to date range filtering if period field not found
-        logger.debug(f"Period field '{period_field}' not found, falling back to date range filtering")
+        logger.warning(f"Period field '{period_field}' not found, falling back to date range filtering")
         return self.filter_by_date_range(
             data, period.start_date, period.end_date, field_name
         )
