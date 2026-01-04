@@ -7,8 +7,8 @@ This enables server-side filtering to dramatically reduce data transfer.
 The key insight: Instead of fetching 391,000 rows and filtering in Python,
 we send filter parameters to NetSuite and only fetch the matching rows.
 
-Uses accountingPeriod_periodname for date filtering (e.g., "Jan 2024", "Feb 2024")
-to match the export file's "Month-End Date (Text Format)" filter.
+Uses periodname (text string like "Jan 2024") or formuladate (date like "1/1/2024")
+for date filtering to match the export file's "Month-End Date (Text Format)" filter.
 """
 import os
 import logging
@@ -32,13 +32,18 @@ class NetSuiteFilterParams:
     These parameters are added to the RESTlet URL query string and
     processed server-side to filter data before pagination.
     
-    Uses accountingPeriod_periodname for date filtering (e.g., "Jan 2024", "Feb 2024")
-    to match the export file's "Month-End Date (Text Format)" filter.
+    Primary date filter: periodNames (e.g., "Jan 2024,Feb 2024,Mar 2024")
+    - Uses periodname field (text string: "Jan 2024", "Feb 2024")
+    - Matches export file's "Month-End Date (Text Format)" filter
+    - Falls back to date range (formuladate) if period filter fails server-side
+    
+    The enhanced RESTlet handles filter failures gracefully and continues
+    without the failed filter, so client-side filtering provides a safety net.
     """
     period_names: Optional[List[str]] = None  # Accounting period names (e.g., ["Jan 2024", "Feb 2024"])
     start_date: Optional[str] = None  # MM/DD/YYYY format (fallback if period_names not provided)
     end_date: Optional[str] = None    # MM/DD/YYYY format (fallback if period_names not provided)
-    date_field: str = "trandate"   # Date field for fallback date filtering (default: trandate)
+    date_field: str = "formuladate"   # Date field for fallback date filtering (default: formuladate - month-end date)
     departments: List[str] = None
     account_prefixes: List[str] = None
     account_name: Optional[str] = None
@@ -58,25 +63,29 @@ class NetSuiteFilterParams:
         """
         Convert to URL query parameters for the RESTlet.
         
-        NOTE: period_names are NOT sent to RESTlet because server-side period filtering
-        doesn't work reliably. Period filtering is applied client-side instead.
+        Sends period_names as primary filter, with date range as fallback.
+        The enhanced RESTlet supports both filtering approaches.
         
         Returns:
             Dict of parameter name to value, ready for URL encoding
         """
         params = {}
         
-        # DO NOT send period_names to RESTlet - server-side filtering doesn't work
-        # Period filtering will be applied client-side using accountingPeriod_periodname
-        # Only use date range as fallback if period_names not available
+        # PRIMARY: Send period names for server-side filtering
+        # The enhanced RESTlet tries multiple approaches to apply this filter
         if self.period_names:
-            # Skip sending periodNames to RESTlet - will filter client-side
-            logger.debug(f"Skipping periodNames server-side filter (will filter client-side): {self.period_names}")
-        elif self.start_date and self.end_date:
-            # Fallback: use date range if period names not available
+            params["periodNames"] = ",".join(self.period_names)
+            logger.debug(f"Server-side period filter: {self.period_names}")
+        
+        # FALLBACK: Use date range if period names not available, OR as additional filter
+        # This filters by formuladate (month-end date) which is accurate for period filtering
+        if self.start_date and self.end_date:
+            # Send date range as fallback/additional filter
+            # If period filter fails server-side, date filter will still reduce rows
             params["startDate"] = self.start_date
             params["endDate"] = self.end_date
             params["dateField"] = self.date_field
+            logger.debug(f"Server-side date filter: {self.start_date} to {self.end_date}")
         
         if self.departments:
             params["department"] = ",".join(self.departments)
@@ -144,7 +153,7 @@ class NetSuiteFilterBuilder:
     This class translates the semantic query understanding (ParsedQuery)
     into concrete NetSuite filter parameters that the RESTlet can apply.
     
-    Uses accountingPeriod_periodname for date filtering (e.g., "Jan 2024", "Feb 2024")
+    Uses periodname (text string) or formuladate (date) for date filtering
     to match the export file's "Month-End Date (Text Format)" filter.
     
     Usage:
@@ -197,14 +206,15 @@ class NetSuiteFilterBuilder:
                     f"Accounting period filter: {', '.join(period_names)} "
                     f"({parsed_query.time_period.period_name})"
                 )
-            else:
-                # Fallback to date range if period names cannot be generated
-                params.start_date = self._format_date(parsed_query.time_period.start_date)
-                params.end_date = self._format_date(parsed_query.time_period.end_date)
-                logger.debug(
-                    f"Date filter (fallback): {params.start_date} to {params.end_date} "
-                    f"({parsed_query.time_period.period_name})"
-                )
+            
+            # ALWAYS set date range as fallback/additional filter
+            # If period filter fails server-side, date filter will still reduce rows
+            params.start_date = self._format_date(parsed_query.time_period.start_date)
+            params.end_date = self._format_date(parsed_query.time_period.end_date)
+            logger.debug(
+                f"Date filter (fallback/additional): {params.start_date} to {params.end_date} "
+                f"({parsed_query.time_period.period_name})"
+            )
         
         # Extract departments
         if parsed_query.departments:
@@ -270,10 +280,11 @@ class NetSuiteFilterBuilder:
             )
             if period_names:
                 params.period_names = period_names
-            else:
-                # Fallback to date range
-                params.start_date = self._format_date(time_period.start_date)
-                params.end_date = self._format_date(time_period.end_date)
+            
+            # ALWAYS set date range as fallback/additional filter
+            # If period filter fails server-side, date filter will still reduce rows
+            params.start_date = self._format_date(time_period.start_date)
+            params.end_date = self._format_date(time_period.end_date)
         
         if departments:
             params.departments = list(departments)
@@ -301,7 +312,7 @@ class NetSuiteFilterBuilder:
         Convert a date range to accounting period names.
         
         Period names are in format "MMM YYYY" (e.g., "Jan 2024", "Feb 2024").
-        This matches the accountingPeriod_periodname field in NetSuite.
+        This matches the periodname field in NetSuite (text string format).
         
         Args:
             start_date: Start date of the range
@@ -346,7 +357,7 @@ def get_filter_builder(date_field: Optional[str] = None) -> NetSuiteFilterBuilde
         date_field: Optional date field override for fallback date filtering.
                    If not provided, reads from NETSUITE_FILTER_DATE_FIELD environment
                    variable (default: "trandate").
-                   Note: Primary filtering uses accountingPeriod_periodname.
+                   Note: Primary filtering uses periodname (text string) or formuladate (date).
     """
     if date_field is None:
         date_field = os.getenv("NETSUITE_FILTER_DATE_FIELD", "trandate")

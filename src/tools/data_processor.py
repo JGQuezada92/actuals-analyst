@@ -79,14 +79,17 @@ class DataProcessor:
         "credit": ["creditamount", "credit", "cr"],
         
         # Date fields - fallback fields for date-range filtering
-        "date": ["trandate", "formuladate", "date", "transaction_date", "tran_date", "postingdate"],
+        # formuladate is month-end date (e.g., "1/1/2025", "2/1/2025")
+        # trandate is transaction date
+        "date": ["formuladate", "trandate", "date", "transaction_date", "tran_date", "postingdate"],
         "month_end_date": ["formuladate", "month_end_date"],
         # Period field - PRIMARY for period-based filtering (matches export file)
+        # Field is a text string: "Jan 2025", "Feb 2025", etc.
         "period": [
-            "accountingPeriod_periodname",      # Primary - matches export file
-            "accountingperiod_periodname",      # Lowercase variant
-            "periodname",                       # Simple variant
+            "periodname",                       # Primary - actual field name in data (text string)
             "period_name",                      # Underscore variant
+            "accountingPeriod_periodname",      # Legacy variant (not in current data)
+            "accountingperiod_periodname",      # Lowercase variant
             "postingperiod",                     # Alternative naming
         ],
         
@@ -286,10 +289,14 @@ class DataProcessor:
         field_name: str = None
     ) -> FilterResult:
         """
-        Filter data to a fiscal period using accountingPeriod_periodname.
+        Filter data to a fiscal period using periodname (text string) or formuladate (date).
         
         This matches the export file's "Month-End Date (Text Format)" filter
         by filtering on period names (e.g., "Jan 2024", "Feb 2024") rather than dates.
+        
+        Field types:
+        - periodname: Text string format (e.g., "Jan 2025", "Feb 2025")
+        - formuladate: Date format (e.g., "1/1/2025", "2/1/2025")
         
         This is the PRIMARY method for date filtering to ensure calculations match
         the export file exactly.
@@ -335,7 +342,7 @@ class DataProcessor:
         Convert a date range to accounting period names.
         
         Period names are in format "MMM YYYY" (e.g., "Jan 2024", "Feb 2024").
-        This matches the accountingPeriod_periodname field format.
+        This matches the periodname field format (text string).
         
         Args:
             start_date: Start date of the range

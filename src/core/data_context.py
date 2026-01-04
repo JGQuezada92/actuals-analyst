@@ -126,7 +126,7 @@ class DataContext:
         """Return fallback configuration if YAML can't be loaded."""
         return {
             "date_fields": {
-                "period_field": "accountingPeriod_periodname",  # Primary for period filtering
+                "period_field": "periodname",  # Primary for period filtering (text string: "Jan 2025")
                 "primary": "trandate",  # Fallback for date-range filtering
                 "fallback": "formuladate",
             },
@@ -186,7 +186,7 @@ class DataContext:
         "Month-End Date (Text Format)" filter. Use this for filtering by period names
         (e.g., "Jan 2024", "Feb 2024") rather than date ranges.
         """
-        return self._config.get("date_fields", {}).get("period_field", "accountingPeriod_periodname")
+        return self._config.get("date_fields", {}).get("period_field", "periodname")
     
     def get_date_fields(self) -> List[str]:
         """
@@ -197,9 +197,9 @@ class DataContext:
         """
         df = self._config.get("date_fields", {})
         return [
-            df.get("period_field", "accountingPeriod_periodname"),  # Primary for period filtering
-            df.get("primary", "trandate"),  # Fallback for date-range filtering
-            df.get("fallback", "formuladate"),
+            df.get("period_field", "periodname"),  # Primary for period filtering (text string)
+            df.get("primary", "formuladate"),  # Fallback for date-range filtering (date value)
+            df.get("fallback", "trandate"),
         ]
     
     # =========================================================================

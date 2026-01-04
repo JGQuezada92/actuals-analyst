@@ -598,6 +598,15 @@ class QueryParser:
                 year += 2000
             return self.fiscal_calendar.get_fiscal_year_range(year)
         
+        # Try to parse "YYYY fiscal year" format (e.g., "2026 fiscal year", "2025 fiscal year")
+        # Pattern: 4-digit year followed by "fiscal year"
+        fy_year_match = re.search(r"\b(\d{4})\s+fiscal\s+year\b", query, re.IGNORECASE)
+        if fy_year_match:
+            year = int(fy_year_match.group(1))
+            result = self.fiscal_calendar.get_fiscal_year_range(year)
+            logger.info(f"Extracted time period: {result.period_name} ({result.start_date} to {result.end_date})")
+            return result
+        
         # Check generic patterns (YTD, current month, etc.)
         for period_type, pattern in self.TIME_PATTERNS.items():
             match = re.search(pattern, query, re.IGNORECASE)

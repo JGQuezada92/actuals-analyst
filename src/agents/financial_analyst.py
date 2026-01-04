@@ -382,7 +382,7 @@ Remember: Use the pre-calculated metrics exactly as provided - do not recalculat
         data = context.raw_data.data
         filters_applied = []
         
-        # Apply time period filter using accountingPeriod_periodname (matches export file)
+        # Apply time period filter using periodname (text string like "Jan 2025") or formuladate (date like "1/1/2025")
         if parsed.time_period:
             result = self.data_processor.filter_by_period(data, parsed.time_period)
             data = result.data
@@ -519,13 +519,22 @@ Remember: Use the pre-calculated metrics exactly as provided - do not recalculat
                 amount_field = col
                 break
         
-        # Find date field
+        # Find date field - prioritize formuladate (month-end date) over trandate
         date_field = None
-        date_fields_patterns = ['date', 'trandate', 'created', 'posted']
-        for col in context.raw_data.column_names:
-            if col.lower() in date_fields_patterns or 'date' in col.lower():
-                date_field = col
+        # Priority order: formuladate (month-end date) > trandate (transaction date) > other date fields
+        preferred_fields = ['formuladate', 'trandate']
+        for preferred in preferred_fields:
+            if preferred in context.raw_data.column_names:
+                date_field = preferred
                 break
+        
+        # Fallback to any date field if preferred not found
+        if not date_field:
+            date_fields_patterns = ['date', 'created', 'posted']
+            for col in context.raw_data.column_names:
+                if col.lower() in date_fields_patterns or 'date' in col.lower():
+                    date_field = col
+                    break
         
         if amount_field:
             # Calculate total
@@ -628,8 +637,20 @@ Remember: Use the pre-calculated metrics exactly as provided - do not recalculat
                 amount_field = col
             if 'type' in col_lower or 'category' in col_lower or 'account' in col_lower:
                 category_field = col
-            if 'date' in col_lower:
-                date_field = col
+        
+        # Prioritize formuladate (month-end date) over trandate for date-based filtering
+        preferred_fields = ['formuladate', 'trandate']
+        for preferred in preferred_fields:
+            if preferred in columns:
+                date_field = preferred
+                break
+        
+        # Fallback to any date field
+        if not date_field:
+            for col in columns:
+                if 'date' in col.lower():
+                    date_field = col
+                    break
         
         # Generate category breakdown chart
         if amount_field and category_field:

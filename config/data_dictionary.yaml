@@ -13,17 +13,19 @@ date_fields:
   # PRIMARY: Period field for period-based filtering (matches NetSuite export file)
   # Use this for filtering by accounting period names (e.g., "Jan 2024", "Feb 2024")
   # This matches the export file's "Month-End Date (Text Format)" filter
-  period_field: "accountingPeriod_periodname"
+  # Field is a text string: "Jan 2025", "Feb 2025", etc.
+  period_field: "periodname"
   period_display_name: "Accounting Period"
   
   # FALLBACK: Date fields for date-range filtering (only used if period field unavailable)
   # Primary date field for date range queries (fallback only)
-  primary: "trandate"
-  primary_display_name: "Transaction Date"
+  # Field is a date value: "1/1/2025", "2/1/2025", etc. (month-end date)
+  primary: "formuladate"
+  primary_display_name: "Month-End Date"
   
   # Fallback if primary is not available
-  fallback: "formuladate"
-  fallback_display_name: "Month-End Date"
+  fallback: "trandate"
+  fallback_display_name: "Transaction Date"
   
   # Date format in the data (for parsing)
   format: "M/D/YYYY"
