@@ -18,6 +18,23 @@ from config.settings import ModelConfig, ModelProvider, get_config
 
 logger = logging.getLogger(__name__)
 
+# Custom exception classes for LLM errors
+class LLMError(Exception):
+    """Base exception for LLM-related errors."""
+    pass
+
+class LLMQuotaExhaustedError(LLMError):
+    """Raised when API quota/credits are exhausted."""
+    pass
+
+class LLMContentBlockedError(LLMError):
+    """Raised when content is blocked by the API."""
+    pass
+
+class LLMAPIError(LLMError):
+    """Raised for general API errors."""
+    pass
+
 @dataclass
 class Message:
     """Standardized message format across all providers."""
@@ -68,6 +85,7 @@ class GeminiClient(BaseLLMClient):
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> LLMResponse:
+        """Generate a response from Gemini with comprehensive error handling."""
         temp = temperature if temperature is not None else self.config.temperature
         tokens = max_tokens if max_tokens is not None else self.config.max_tokens
         
@@ -97,29 +115,105 @@ class GeminiClient(BaseLLMClient):
             max_output_tokens=tokens,
         )
         
-        # Start chat and send messages
-        if len(chat_messages) > 1:
-            chat = model.start_chat(history=chat_messages[:-1])
-            response = chat.send_message(
-                chat_messages[-1]["parts"][0],
-                generation_config=generation_config
-            )
-        else:
-            response = model.generate_content(
-                chat_messages[0]["parts"][0] if chat_messages else "",
-                generation_config=generation_config
+        try:
+            # Make the API call
+            if len(chat_messages) > 1:
+                chat = model.start_chat(history=chat_messages[:-1])
+                response = chat.send_message(
+                    chat_messages[-1]["parts"][0],
+                    generation_config=generation_config
+                )
+            else:
+                response = model.generate_content(
+                    chat_messages[0]["parts"][0] if chat_messages else "",
+                    generation_config=generation_config
+                )
+            
+            # Check for empty or blocked response
+            if not response.candidates:
+                block_reason = getattr(response, 'prompt_feedback', None)
+                if block_reason:
+                    logger.error(f"Gemini blocked prompt: {block_reason}")
+                    raise LLMContentBlockedError(f"Content blocked by Gemini: {block_reason}")
+                raise LLMAPIError("Gemini returned empty response with no candidates")
+            
+            # Check candidate finish reason
+            candidate = response.candidates[0]
+            finish_reason = getattr(candidate, 'finish_reason', None)
+            
+            # Handle blocked or problematic finish reasons
+            if finish_reason and str(finish_reason) not in ['STOP', 'MAX_TOKENS', '1', '2']:
+                logger.warning(f"Gemini finish reason: {finish_reason}")
+                if 'SAFETY' in str(finish_reason) or 'BLOCKED' in str(finish_reason):
+                    raise LLMContentBlockedError(f"Content blocked: {finish_reason}")
+            
+            # Extract text safely
+            try:
+                content = response.text
+            except ValueError as e:
+                # response.text raises ValueError if no valid text
+                logger.error(f"Failed to extract text from Gemini response: {e}")
+                raise LLMAPIError(f"No valid text in response: {e}") from e
+            
+            return LLMResponse(
+                content=content,
+                model=self.config.model_name,
+                provider=ModelProvider.GEMINI,
+                usage={
+                    "prompt_tokens": response.usage_metadata.prompt_token_count if hasattr(response, 'usage_metadata') and response.usage_metadata else 0,
+                    "completion_tokens": response.usage_metadata.candidates_token_count if hasattr(response, 'usage_metadata') and response.usage_metadata else 0,
+                },
+                raw_response=response
             )
         
-        return LLMResponse(
-            content=response.text,
-            model=self.config.model_name,
-            provider=ModelProvider.GEMINI,
-            usage={
-                "prompt_tokens": response.usage_metadata.prompt_token_count if hasattr(response, 'usage_metadata') else 0,
-                "completion_tokens": response.usage_metadata.candidates_token_count if hasattr(response, 'usage_metadata') else 0,
-            },
-            raw_response=response
-        )
+        except LLMError:
+            # Re-raise our custom exceptions as-is
+            raise
+        
+        except Exception as e:
+            error_str = str(e).lower()
+            error_type = type(e).__name__
+            
+            # Check for quota/billing errors
+            if any(term in error_str for term in [
+                'resourceexhausted', 'quota', '429', 'rate limit', 
+                'billing', 'payment', 'insufficient'
+            ]):
+                logger.error(f"Gemini API quota exhausted: {e}")
+                raise LLMQuotaExhaustedError(
+                    f"Gemini API quota exhausted or billing issue. "
+                    f"Check your quota at https://console.cloud.google.com/apis/api/generativelanguage.googleapis.com/quotas "
+                    f"or billing at https://console.cloud.google.com/billing. "
+                    f"Original error: {e}"
+                ) from e
+            
+            # Check for authentication errors
+            if any(term in error_str for term in [
+                'authentication', 'unauthorized', '401', 'invalid api key', 'permission'
+            ]):
+                logger.error(f"Gemini API authentication failed: {e}")
+                raise LLMAPIError(
+                    f"Gemini API authentication failed. Check your GEMINI_API_KEY. "
+                    f"Original error: {e}"
+                ) from e
+            
+            # Check for blocked content
+            if any(term in error_str for term in [
+                'blocked', 'safety', 'harmful', 'prohibited'
+            ]):
+                logger.error(f"Gemini blocked content: {e}")
+                raise LLMContentBlockedError(f"Content blocked by Gemini: {e}") from e
+            
+            # Check for network/timeout errors
+            if any(term in error_str for term in [
+                'timeout', 'connection', 'network', 'unreachable'
+            ]):
+                logger.error(f"Gemini API network error: {e}")
+                raise LLMAPIError(f"Network error calling Gemini API: {e}") from e
+            
+            # Generic API error
+            logger.error(f"Gemini API error ({error_type}): {e}")
+            raise LLMAPIError(f"Gemini API call failed ({error_type}): {e}") from e
 
 class ClaudeClient(BaseLLMClient):
     """Anthropic Claude API client."""
@@ -138,6 +232,7 @@ class ClaudeClient(BaseLLMClient):
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> LLMResponse:
+        """Generate a response from Claude with comprehensive error handling."""
         temp = temperature if temperature is not None else self.config.temperature
         tokens = max_tokens if max_tokens is not None else self.config.max_tokens
         
@@ -160,18 +255,55 @@ class ClaudeClient(BaseLLMClient):
         if system:
             kwargs["system"] = system
         
-        response = self.client.messages.create(**kwargs)
+        try:
+            response = self.client.messages.create(**kwargs)
+            
+            # Check for empty response
+            if not response.content:
+                raise LLMAPIError("Claude returned empty response")
+            
+            return LLMResponse(
+                content=response.content[0].text,
+                model=self.config.model_name,
+                provider=ModelProvider.CLAUDE,
+                usage={
+                    "prompt_tokens": response.usage.input_tokens,
+                    "completion_tokens": response.usage.output_tokens,
+                },
+                raw_response=response
+            )
         
-        return LLMResponse(
-            content=response.content[0].text,
-            model=self.config.model_name,
-            provider=ModelProvider.CLAUDE,
-            usage={
-                "prompt_tokens": response.usage.input_tokens,
-                "completion_tokens": response.usage.output_tokens,
-            },
-            raw_response=response
-        )
+        except LLMError:
+            raise
+        
+        except Exception as e:
+            error_str = str(e).lower()
+            error_type = type(e).__name__
+            
+            # Check for quota/billing errors
+            if any(term in error_str for term in [
+                'rate_limit', 'quota', '429', 'billing', 'credit', 'insufficient'
+            ]):
+                logger.error(f"Claude API quota exhausted: {e}")
+                raise LLMQuotaExhaustedError(
+                    f"Claude API quota exhausted or billing issue. "
+                    f"Check your usage at https://console.anthropic.com/settings/usage. "
+                    f"Original error: {e}"
+                ) from e
+            
+            # Check for authentication errors
+            if any(term in error_str for term in [
+                'authentication', 'unauthorized', '401', 'invalid api key'
+            ]):
+                logger.error(f"Claude API authentication failed: {e}")
+                raise LLMAPIError(
+                    f"Claude API authentication failed. Check your ANTHROPIC_API_KEY. "
+                    f"Original error: {e}"
+                ) from e
+            
+            # Generic error
+            logger.error(f"Claude API error ({error_type}): {e}")
+            raise LLMAPIError(f"Claude API call failed ({error_type}): {e}") from e
 
 class OpenAIClient(BaseLLMClient):
     """OpenAI GPT API client."""
@@ -190,28 +322,75 @@ class OpenAIClient(BaseLLMClient):
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> LLMResponse:
+        """Generate a response from OpenAI with comprehensive error handling."""
         temp = temperature if temperature is not None else self.config.temperature
         tokens = max_tokens if max_tokens is not None else self.config.max_tokens
         
         api_messages = [{"role": m.role, "content": m.content} for m in messages]
         
-        response = self.client.chat.completions.create(
-            model=self.config.model_name,
-            messages=api_messages,
-            temperature=temp,
-            max_tokens=tokens,
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model_name,
+                messages=api_messages,
+                temperature=temp,
+                max_tokens=tokens,
+            )
+            
+            # Check for empty response
+            if not response.choices:
+                raise LLMAPIError("OpenAI returned empty response")
+            
+            content = response.choices[0].message.content
+            if content is None:
+                raise LLMAPIError("OpenAI returned null content")
+            
+            return LLMResponse(
+                content=content,
+                model=self.config.model_name,
+                provider=ModelProvider.OPENAI,
+                usage={
+                    "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+                    "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+                },
+                raw_response=response
+            )
         
-        return LLMResponse(
-            content=response.choices[0].message.content,
-            model=self.config.model_name,
-            provider=ModelProvider.OPENAI,
-            usage={
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-            },
-            raw_response=response
-        )
+        except LLMError:
+            raise
+        
+        except Exception as e:
+            error_str = str(e).lower()
+            error_type = type(e).__name__
+            
+            # Check for quota/billing errors
+            if any(term in error_str for term in [
+                'rate_limit', 'quota', '429', 'billing', 'insufficient_quota'
+            ]):
+                logger.error(f"OpenAI API quota exhausted: {e}")
+                raise LLMQuotaExhaustedError(
+                    f"OpenAI API quota exhausted or billing issue. "
+                    f"Check your usage at https://platform.openai.com/usage. "
+                    f"Original error: {e}"
+                ) from e
+            
+            # Check for authentication errors
+            if any(term in error_str for term in [
+                'authentication', 'unauthorized', '401', 'invalid api key'
+            ]):
+                logger.error(f"OpenAI API authentication failed: {e}")
+                raise LLMAPIError(
+                    f"OpenAI API authentication failed. Check your OPENAI_API_KEY. "
+                    f"Original error: {e}"
+                ) from e
+            
+            # Check for content policy
+            if any(term in error_str for term in ['content_policy', 'flagged', 'moderation']):
+                logger.error(f"OpenAI content policy violation: {e}")
+                raise LLMContentBlockedError(f"Content blocked by OpenAI: {e}") from e
+            
+            # Generic error
+            logger.error(f"OpenAI API error ({error_type}): {e}")
+            raise LLMAPIError(f"OpenAI API call failed ({error_type}): {e}") from e
 
 class ModelRouter:
     """
@@ -253,9 +432,23 @@ class ModelRouter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> LLMResponse:
-        """Route generation request to the active model."""
+        """Route generation request to the active model with error handling."""
         logger.info(f"Routing request to {self.config.provider.value}:{self.config.model_name}")
-        return self._client.generate(messages, temperature, max_tokens)
+        
+        try:
+            return self._client.generate(messages, temperature, max_tokens)
+        except LLMQuotaExhaustedError as e:
+            logger.error(f"LLM quota exhausted: {e}")
+            raise
+        except LLMContentBlockedError as e:
+            logger.warning(f"LLM content blocked: {e}")
+            raise
+        except LLMAPIError as e:
+            logger.error(f"LLM API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error in model router: {e}")
+            raise LLMAPIError(f"Unexpected error: {e}") from e
     
     def generate_with_system(
         self,
@@ -294,3 +487,16 @@ def get_judge_router() -> ModelRouter:
     """Get a router configured for the judge model (cross-model evaluation)."""
     app_config = get_config()
     return ModelRouter(app_config.judge_model_config)
+
+# Export custom exceptions for use by other modules
+__all__ = [
+    'Message',
+    'LLMResponse',
+    'ModelRouter',
+    'get_router',
+    'get_judge_router',
+    'LLMError',
+    'LLMQuotaExhaustedError',
+    'LLMContentBlockedError',
+    'LLMAPIError',
+]

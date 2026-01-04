@@ -22,8 +22,19 @@ class TestNetSuiteFilterParams:
         query_params = params.to_query_params()
         assert query_params == {"excludeTotals": "true"}
     
-    def test_to_query_params_date_range(self):
-        """Date range should be formatted correctly."""
+    def test_to_query_params_period_names(self):
+        """Period names should be formatted correctly."""
+        params = NetSuiteFilterParams(
+            period_names=["Feb 2024", "Mar 2024", "Apr 2024"]
+        )
+        query_params = params.to_query_params()
+        
+        assert query_params["periodNames"] == "Feb 2024,Mar 2024,Apr 2024"
+        assert "startDate" not in query_params
+        assert "endDate" not in query_params
+    
+    def test_to_query_params_date_range_fallback(self):
+        """Date range should be used as fallback if period names not provided."""
         params = NetSuiteFilterParams(
             start_date="02/01/2024",
             end_date="12/31/2024",
@@ -33,6 +44,7 @@ class TestNetSuiteFilterParams:
         assert query_params["startDate"] == "02/01/2024"
         assert query_params["endDate"] == "12/31/2024"
         assert query_params["dateField"] == "trandate"
+        assert "periodNames" not in query_params
     
     def test_to_query_params_departments(self):
         """Multiple departments should be comma-separated."""

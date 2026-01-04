@@ -23,10 +23,13 @@ import json
 import hashlib
 import logging
 import asyncio
+import time
+import random
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple, TYPE_CHECKING
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 logger = logging.getLogger(__name__)
@@ -512,24 +515,17 @@ class NetSuiteRESTClient:
         elif self._should_use_parallel_fetch(total_pages):
             logger.info(f"Using parallel fetch for {total_pages} pages")
             
+            # Use ThreadPoolExecutor - works regardless of event loop state
             try:
-                loop = asyncio.get_running_loop()
-                logger.info("Existing event loop, falling back to sequential")
-                return self._execute_via_restlet_filtered(search_id, start_time, filter_params)
-            except RuntimeError:
-                pass
-            
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                all_results = loop.run_until_complete(
-                    self._fetch_all_pages_parallel(
-                        base_restlet_url, query_params, total_pages, first_page_results
-                    )
+                all_results = self._fetch_all_pages_threaded(
+                    base_restlet_url,
+                    query_params,
+                    total_pages,
+                    first_page_results,
                 )
-            finally:
-                loop.close()
-                asyncio.set_event_loop(None)
+            except Exception as e:
+                logger.warning(f"Threaded parallel fetch failed, falling back to sequential: {e}")
+                return self._execute_via_restlet_filtered(search_id, start_time, filter_params)
         else:
             logger.info(f"Using sequential fetch for {total_pages} pages (below parallel threshold)")
             return self._execute_via_restlet_filtered(search_id, start_time, filter_params)
@@ -566,6 +562,288 @@ class NetSuiteRESTClient:
         except Exception as e:
             logger.warning(f"Failed to update registry: {e}")
     
+    def _fetch_page_sync(
+        self,
+        base_url: str,
+        query_params: Dict[str, str],
+        page: int,
+        request_delay: float = 0.0,
+        max_retries: int = 3,
+    ) -> Tuple[int, List[Dict[str, Any]]]:
+        """
+        Fetch a single page synchronously with retry logic.
+        
+        This is used by ThreadPoolExecutor for parallel fetching.
+        Includes staggered delay to prevent OAuth signature collisions.
+        
+        Args:
+            base_url: RESTlet base URL
+            query_params: Query parameters (without page)
+            page: Page number to fetch
+            request_delay: Delay before making request (for staggering)
+            max_retries: Maximum retry attempts
+        
+        Returns:
+            Tuple of (page_number, results)
+        """
+        # Staggered delay BEFORE generating OAuth headers
+        # This ensures unique timestamps across parallel requests
+        if request_delay > 0:
+            time.sleep(request_delay)
+        
+        # Build params with page number
+        params = dict(query_params)
+        params["page"] = str(page)
+        
+        last_error = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                # Generate FRESH OAuth headers for each attempt
+                # This must happen AFTER any delays to ensure valid timestamp
+                headers = self._get_auth_headers_for_restlet("GET", base_url, params)
+                
+                # Build the full URL
+                query_string = "&".join(
+                    f"{k}={requests.utils.quote(str(v))}" 
+                    for k, v in params.items()
+                )
+                full_url = f"{base_url}?{query_string}"
+                
+                # Make the request
+                response = requests.get(full_url, headers=headers, timeout=120)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get("success"):
+                        return page, result.get("results", [])
+                    else:
+                        error_msg = result.get("error", "Unknown error")
+                        
+                        # Check for rate limit in response body
+                        if "SSS_REQUEST_LIMIT_EXCEEDED" in str(error_msg):
+                            if attempt < max_retries:
+                                wait_time = (2 ** attempt) + random.uniform(0.5, 1.5)
+                                logger.warning(
+                                    f"Page {page} rate limited (attempt {attempt + 1}/{max_retries + 1}), "
+                                    f"waiting {wait_time:.1f}s..."
+                                )
+                                time.sleep(wait_time)
+                                continue
+                        
+                        last_error = f"RESTlet error: {error_msg}"
+                
+                elif response.status_code == 400:
+                    # Bad request - likely OAuth signature issue or malformed request
+                    text = response.text[:500]
+                    logger.warning(f"Page {page} got 400 Bad Request: {text}")
+                    
+                    if attempt < max_retries:
+                        wait_time = (2 ** attempt) + random.uniform(0.1, 0.5)
+                        logger.warning(
+                            f"Page {page} bad request (attempt {attempt + 1}/{max_retries + 1}), "
+                            f"retrying in {wait_time:.1f}s..."
+                        )
+                        time.sleep(wait_time)
+                        continue
+                    
+                    last_error = f"Bad request: {text}"
+                
+                elif response.status_code == 403:
+                    # Auth failure
+                    text = response.text[:200]
+                    
+                    if attempt < max_retries:
+                        wait_time = (2 ** attempt) + random.uniform(0.5, 1.0)
+                        logger.warning(
+                            f"Page {page} auth failed (attempt {attempt + 1}/{max_retries + 1}), "
+                            f"retrying in {wait_time:.1f}s..."
+                        )
+                        time.sleep(wait_time)
+                        continue
+                    
+                    last_error = f"Auth failed (403): {text}"
+                
+                elif response.status_code == 429:
+                    # Explicit rate limit
+                    if attempt < max_retries:
+                        wait_time = (2 ** attempt) + random.uniform(1.0, 2.0)
+                        logger.warning(
+                            f"Page {page} rate limited (attempt {attempt + 1}/{max_retries + 1}), "
+                            f"waiting {wait_time:.1f}s..."
+                        )
+                        time.sleep(wait_time)
+                        continue
+                    
+                    last_error = f"Rate limited (429) after {max_retries + 1} attempts"
+                
+                else:
+                    text = response.text[:200]
+                    last_error = f"HTTP {response.status_code}: {text}"
+                    
+                    if attempt < max_retries:
+                        wait_time = 2 ** attempt
+                        logger.warning(
+                            f"Page {page} got {response.status_code}, "
+                            f"retrying in {wait_time}s..."
+                        )
+                        time.sleep(wait_time)
+                        continue
+                        
+            except requests.exceptions.Timeout:
+                last_error = "Request timeout"
+                if attempt < max_retries:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"Page {page} timed out, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+            
+            except requests.exceptions.RequestException as e:
+                last_error = str(e)
+                if attempt < max_retries:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"Page {page} error: {e}, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+            
+            except Exception as e:
+                last_error = f"Unexpected error: {e}"
+                logger.error(f"Page {page} unexpected error: {e}")
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+        
+        logger.error(f"Page {page} failed after {max_retries + 1} attempts: {last_error}")
+        raise DataRetrievalError(f"Page {page} failed: {last_error}")
+
+    def _fetch_all_pages_threaded(
+        self,
+        base_url: str,
+        query_params: Dict[str, str],
+        total_pages: int,
+        first_page_results: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch all pages using ThreadPoolExecutor with OAuth-safe staggering.
+        
+        This method uses staggered request submission to prevent OAuth
+        signature collisions that cause INVALID_LOGIN_ATTEMPT errors.
+        
+        Args:
+            base_url: RESTlet base URL
+            query_params: Base query parameters (without page number)
+            total_pages: Total number of pages to fetch
+            first_page_results: Results from page 0 (already fetched)
+        
+        Returns:
+            All results combined in page order
+        """
+        # CRITICAL: Keep max_workers LOW to prevent OAuth collisions
+        # NetSuite's OAuth 1.0a doesn't handle many simultaneous auth attempts well
+        max_workers = min(int(os.getenv("NETSUITE_MAX_CONCURRENT_PAGES", "5")), 6)
+        
+        # Delay between batches (seconds)
+        batch_delay = float(os.getenv("NETSUITE_BATCH_DELAY_SECONDS", "2.0"))
+        
+        # Stagger delay between requests within a batch (seconds)
+        # This ensures each request gets a unique OAuth timestamp/nonce
+        intra_batch_delay = float(os.getenv("NETSUITE_INTRA_BATCH_DELAY", "0.3"))
+        
+        # Page 0 is already fetched
+        pages_to_fetch = list(range(1, total_pages))
+        
+        if not pages_to_fetch:
+            return first_page_results
+        
+        logger.info(
+            f"Fetching {len(pages_to_fetch)} pages using ThreadPoolExecutor "
+            f"(max workers: {max_workers}, stagger: {intra_batch_delay}s)"
+        )
+        
+        results_by_page: Dict[int, List[Dict]] = {0: first_page_results}
+        failed_pages: List[Tuple[int, str]] = []
+        
+        total_batches = (len(pages_to_fetch) + max_workers - 1) // max_workers
+        
+        for batch_idx, batch_start in enumerate(range(0, len(pages_to_fetch), max_workers)):
+            batch_pages = pages_to_fetch[batch_start:batch_start + max_workers]
+            batch_num = batch_idx + 1
+            
+            logger.info(
+                f"Processing batch {batch_num}/{total_batches}: "
+                f"pages {batch_pages[0]}-{batch_pages[-1]} ({len(batch_pages)} pages)"
+            )
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit requests with staggered delays to prevent OAuth collisions
+                future_to_page = {}
+                for i, page in enumerate(batch_pages):
+                    # Stagger each request within the batch
+                    stagger_delay = i * intra_batch_delay
+                    future = executor.submit(
+                        self._fetch_page_sync,
+                        base_url,
+                        query_params,
+                        page,
+                        stagger_delay,  # Pass the stagger delay
+                    )
+                    future_to_page[future] = page
+                
+                # Collect results
+                for future in as_completed(future_to_page):
+                    page = future_to_page[future]
+                    try:
+                        page_num, page_data = future.result()
+                        results_by_page[page_num] = page_data
+                        logger.debug(f"Page {page_num}: {len(page_data)} rows")
+                    except Exception as e:
+                        error_msg = str(e)
+                        logger.warning(f"Page {page} failed in batch: {error_msg}")
+                        failed_pages.append((page, error_msg))
+            
+            # Delay between batches to let NetSuite's auth system recover
+            if batch_start + max_workers < len(pages_to_fetch):
+                logger.debug(f"Batch delay: {batch_delay}s")
+                time.sleep(batch_delay)
+        
+        # Retry failed pages one at a time with longer delays
+        if failed_pages:
+            logger.info(f"Retrying {len(failed_pages)} failed pages sequentially...")
+            
+            for page, original_error in failed_pages:
+                logger.info(f"Retrying page {page} (original error: {original_error[:50]}...)")
+                
+                # Longer delay before retry
+                time.sleep(3.0)
+                
+                try:
+                    page_num, page_data = self._fetch_page_sync(
+                        base_url, query_params, page, 
+                        request_delay=0,  # No additional delay needed
+                        max_retries=5,    # More retries for failed pages
+                    )
+                    results_by_page[page_num] = page_data
+                    logger.info(f"Page {page_num} succeeded on retry ({len(page_data)} rows)")
+                except Exception as e:
+                    logger.error(f"Page {page} failed permanently: {e}")
+                    raise DataRetrievalError(
+                        f"Failed to fetch page {page} after all retries. "
+                        f"Try reducing NETSUITE_MAX_CONCURRENT_PAGES to 3-4."
+                    )
+        
+        # Combine results in page order
+        all_results = []
+        for page in range(total_pages):
+            page_results = results_by_page.get(page, [])
+            all_results.extend(page_results)
+        
+        logger.info(
+            f"Parallel fetch complete: {len(all_results):,} total rows "
+            f"from {total_pages} pages"
+        )
+        
+        return all_results
+
     def _get_auth_headers_for_restlet(self, method: str, url: str, query_params: dict = None) -> Dict[str, str]:
         """Generate OAuth 1.0 headers for RESTlet calls, including query params in signature."""
         import time
@@ -858,40 +1136,16 @@ class NetSuiteRESTClient:
             if self._should_use_parallel_fetch(total_pages):
                 logger.info(f"Using parallel pagination for {total_pages} pages")
                 
-                # Run async fetch - handle existing event loops gracefully
+                # Use ThreadPoolExecutor - works regardless of event loop state
                 try:
-                    # Try to get an existing running loop
-                    try:
-                        loop = asyncio.get_running_loop()
-                        # If we're in an existing loop, we can't use run_until_complete
-                        # However, we can still use parallel fetch by creating a new thread
-                        # with its own event loop, or fall back to sequential
-                        logger.warning(
-                            f"Existing event loop detected. Parallel fetch requires a new event loop. "
-                            f"Falling back to sequential fetch for {total_pages} pages. "
-                            f"This may take longer - consider running outside asyncio.run() for faster parallel fetching."
-                        )
-                        return self._execute_via_restlet(search_id, start_time)
-                    except RuntimeError:
-                        # No running loop - safe to create one
-                        pass
-                    
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        all_results = loop.run_until_complete(
-                            self._fetch_all_pages_parallel(
-                                base_restlet_url,
-                                query_params,
-                                total_pages,
-                                first_page_results,
-                            )
-                        )
-                    finally:
-                        loop.close()
-                        asyncio.set_event_loop(None)
+                    all_results = self._fetch_all_pages_threaded(
+                        base_restlet_url,
+                        query_params,
+                        total_pages,
+                        first_page_results,
+                    )
                 except Exception as e:
-                    logger.warning(f"Parallel fetch failed, falling back to sequential: {e}")
+                    logger.warning(f"Threaded parallel fetch failed, falling back to sequential: {e}")
                     # Fall back to sequential
                     return self._execute_via_restlet(search_id, start_time)
             else:

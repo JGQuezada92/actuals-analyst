@@ -269,10 +269,75 @@ class DataProcessor:
         period: FiscalPeriod,
         field_name: str = None
     ) -> FilterResult:
-        """Filter data to a fiscal period."""
+        """
+        Filter data to a fiscal period using accountingPeriod_periodname.
+        
+        This matches the export file's "Month-End Date (Text Format)" filter
+        by filtering on period names (e.g., "Jan 2024", "Feb 2024") rather than dates.
+        """
+        # Try to filter by period name first (matches export file)
+        period_field = field_name or self.find_field(data, "period")
+        
+        if period_field:
+            # Generate period names for the date range
+            period_names = self._date_range_to_period_names(
+                period.start_date,
+                period.end_date
+            )
+            
+            if period_names:
+                # Filter by period names (e.g., "Feb 2025", "Mar 2025")
+                filtered = []
+                for row in data:
+                    row_period = str(row.get(period_field, '')).strip()
+                    if row_period in period_names:
+                        filtered.append(row)
+                
+                return FilterResult(
+                    data=filtered,
+                    original_count=len(data),
+                    filtered_count=len(filtered),
+                    filters_applied=[f"{period_field} in {period_names}"],
+                )
+        
+        # Fallback to date range filtering if period field not found
+        logger.debug(f"Period field '{period_field}' not found, falling back to date range filtering")
         return self.filter_by_date_range(
             data, period.start_date, period.end_date, field_name
         )
+    
+    def _date_range_to_period_names(self, start_date: date, end_date: date) -> List[str]:
+        """
+        Convert a date range to accounting period names.
+        
+        Period names are in format "MMM YYYY" (e.g., "Jan 2024", "Feb 2024").
+        This matches the accountingPeriod_periodname field format.
+        
+        Args:
+            start_date: Start date of the range
+            end_date: End date of the range
+        
+        Returns:
+            List of period names covering the date range
+        """
+        from calendar import month_abbr
+        
+        period_names = []
+        current = date(start_date.year, start_date.month, 1)
+        end = date(end_date.year, end_date.month, 1)
+        
+        while current <= end:
+            month_abbr_name = month_abbr[current.month].strip()
+            period_name = f"{month_abbr_name} {current.year}"
+            period_names.append(period_name)
+            
+            # Move to next month
+            if current.month == 12:
+                current = date(current.year + 1, 1, 1)
+            else:
+                current = date(current.year, current.month + 1, 1)
+        
+        return period_names
     
     def filter_by_account(
         self,

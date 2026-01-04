@@ -48,11 +48,32 @@ define(['N/search', 'N/log', 'N/format'], function(search, log, format) {
             end = parts[1] + '/' + parts[2] + '/' + parts[0];
         }
         
-        return search.createFilter({
-            name: fieldId,
-            operator: search.Operator.WITHIN,
-            values: [start, end]
+        log.debug('Creating date filter', {
+            field: fieldId,
+            start: start,
+            end: end,
+            operator: 'WITHIN'
         });
+        
+        try {
+            var filter = search.createFilter({
+                name: fieldId,
+                operator: search.Operator.WITHIN,
+                values: [start, end]
+            });
+            log.debug('Date filter created successfully', { field: fieldId });
+            return filter;
+        } catch (e) {
+            log.error('buildDateFilter failed', {
+                field: fieldId,
+                start: start,
+                end: end,
+                error: e.message,
+                name: e.name,
+                toString: e.toString()
+            });
+            throw e; // Re-throw to be caught by caller
+        }
     }
 
     /**
@@ -132,31 +153,147 @@ define(['N/search', 'N/log', 'N/format'], function(search, log, format) {
         var filters = [];
         
         // =====================================================================
-        // DATE RANGE FILTER
+        // ACCOUNTING PERIOD FILTER
         // =====================================================================
-        // Uses trandate (Accounting Posting Date) for date filtering
-        // Note: formuladate is a formula field and cannot be filtered directly
-        if (params.startDate && params.endDate) {
-            log.debug('Adding date filter', { 
+        // Uses accountingPeriod_periodname (Accounting Period: Name) for filtering
+        // This matches the export file's "Month-End Date (Text Format)" filter
+        // Period names are in format "Jan 2024", "Feb 2024", etc.
+        if (params.periodNames) {
+            log.debug('Adding accounting period filter', { 
+                periodNames: params.periodNames
+            });
+            
+            try {
+                // Parse comma-separated period names
+                var periodNamesArray = params.periodNames.split(',').map(function(p) {
+                    return p.trim();
+                }).filter(function(p) {
+                    return p.length > 0;
+                });
+                
+                if (periodNamesArray.length > 0) {
+                    log.debug('Attempting to create accounting period filter', {
+                        periods: periodNamesArray.length,
+                        samplePeriods: periodNamesArray.slice(0, 3)
+                    });
+                    
+                    // Try different approaches to create the filter
+                    var periodFilter = null;
+                    var filterCreated = false;
+                    
+                    // Approach 1: Try with 'accountingPeriod' join (most common)
+                    try {
+                        periodFilter = search.createFilter({
+                            name: 'periodname',
+                            join: 'accountingPeriod',
+                            operator: search.Operator.ANYOF,
+                            values: periodNamesArray
+                        });
+                        filterCreated = true;
+                        log.debug('Accounting period filter created with accountingPeriod join');
+                    } catch (e1) {
+                        log.debug('Failed with accountingPeriod join, trying alternatives', {
+                            error: e1.message
+                        });
+                        
+                        // Approach 2: Try with 'accountingperiod' (lowercase)
+                        try {
+                            periodFilter = search.createFilter({
+                                name: 'periodname',
+                                join: 'accountingperiod',
+                                operator: search.Operator.ANYOF,
+                                values: periodNamesArray
+                            });
+                            filterCreated = true;
+                            log.debug('Accounting period filter created with accountingperiod join');
+                        } catch (e2) {
+                            log.debug('Failed with accountingperiod join, trying without join', {
+                                error: e2.message
+                            });
+                            
+                            // Approach 3: Try without join (if field exists directly)
+                            try {
+                                periodFilter = search.createFilter({
+                                    name: 'accountingPeriod_periodname',
+                                    operator: search.Operator.ANYOF,
+                                    values: periodNamesArray
+                                });
+                                filterCreated = true;
+                                log.debug('Accounting period filter created without join');
+                            } catch (e3) {
+                                log.error('All accounting period filter approaches failed', {
+                                    error1: e1.message,
+                                    error2: e2.message,
+                                    error3: e3.message
+                                });
+                                throw e1; // Throw original error
+                            }
+                        }
+                    }
+                    
+                    if (filterCreated && periodFilter) {
+                        filters.push(periodFilter);
+                        log.debug('Accounting period filter added successfully', { 
+                            periods: periodNamesArray.length 
+                        });
+                    }
+                }
+            } catch (e) {
+                log.error('Accounting period filter error', {
+                    message: e.message,
+                    name: e.name,
+                    toString: e.toString(),
+                    periodNames: params.periodNames
+                });
+                // Store error info
+                if (!params._dateFilterErrors) {
+                    params._dateFilterErrors = [];
+                }
+                params._dateFilterErrors.push({
+                    field: 'accountingPeriod_periodname',
+                    error: e.message,
+                    type: e.name
+                });
+                // Don't throw - continue without period filter
+                log.warning('Continuing without accounting period filter due to error');
+            }
+        }
+        
+        // =====================================================================
+        // DATE RANGE FILTER (FALLBACK - for backward compatibility)
+        // =====================================================================
+        // Only use if periodNames is not provided
+        if (!params.periodNames && params.startDate && params.endDate) {
+            log.debug('Adding date filter (fallback)', { 
                 start: params.startDate, 
                 end: params.endDate,
                 field: params.dateField || 'trandate'
             });
             
-            // Use configurable date field, default to trandate (Accounting Posting Date)
             var dateField = params.dateField || 'trandate';
             
             try {
-                filters.push(buildDateFilter(dateField, params.startDate, params.endDate));
+                var dateFilter = buildDateFilter(dateField, params.startDate, params.endDate);
+                filters.push(dateFilter);
+                log.debug('Date filter created successfully', { field: dateField });
             } catch (e) {
-                log.error('Date filter error', e);
-                // Try alternative date field as fallback
-                try {
-                    filters.push(buildDateFilter('formuladate', params.startDate, params.endDate));
-                    log.debug('Fell back to formuladate filter');
-                } catch (e2) {
-                    log.error('Fallback date filter also failed', e2);
+                log.error('Date filter error for ' + dateField, {
+                    message: e.message,
+                    name: e.name,
+                    toString: e.toString(),
+                    field: dateField,
+                    startDate: params.startDate,
+                    endDate: params.endDate
+                });
+                // Store error info
+                if (!params._dateFilterErrors) {
+                    params._dateFilterErrors = [];
                 }
+                params._dateFilterErrors.push({
+                    field: dateField,
+                    error: e.message,
+                    type: e.name
+                });
             }
         }
         
@@ -323,9 +460,11 @@ define(['N/search', 'N/log', 'N/format'], function(search, log, format) {
      * @param {string} requestParams.searchId - The saved search ID (required)
      * @param {number} [requestParams.pageSize] - Results per page (default: 1000, max: 1000)
      * @param {number} [requestParams.page] - Page number (default: 0)
-     * @param {string} [requestParams.startDate] - Start date for date range filter (MM/DD/YYYY or YYYY-MM-DD)
+     * @param {string} [requestParams.periodNames] - Accounting period names to filter (comma-separated, e.g., "Jan 2024,Feb 2024,Mar 2024")
+     *                                                 Uses accountingPeriod_periodname field. This is the PRIMARY method for date filtering.
+     * @param {string} [requestParams.startDate] - Start date for date range filter (MM/DD/YYYY or YYYY-MM-DD) - fallback if periodNames not provided
      * @param {string} [requestParams.endDate] - End date for date range filter
-     * @param {string} [requestParams.dateField] - Date field to filter on (default: trandate - Accounting Posting Date)
+     * @param {string} [requestParams.dateField] - Date field to filter on (default: trandate) - only used if periodNames not provided
      * @param {string} [requestParams.department] - Department name(s) to filter (comma-separated)
      * @param {string} [requestParams.accountPrefix] - Account number prefix(es) to filter (comma-separated)
      * @param {string} [requestParams.accountName] - Account name to filter (contains)
@@ -353,6 +492,7 @@ define(['N/search', 'N/log', 'N/format'], function(search, log, format) {
                 searchId: searchId, 
                 pageSize: pageSize, 
                 page: pageNum,
+                hasPeriodFilter: !!requestParams.periodNames,
                 hasDateFilter: !!(requestParams.startDate && requestParams.endDate),
                 hasDepartmentFilter: !!requestParams.department,
                 hasAccountFilter: !!requestParams.accountPrefix,
@@ -364,11 +504,44 @@ define(['N/search', 'N/log', 'N/format'], function(search, log, format) {
             // Load the saved search
             var savedSearch = search.load({ id: searchId });
             
+            // Log available joins and columns for debugging
+            var availableJoins = [];
+            var periodColumns = [];
+            if (savedSearch.columns) {
+                savedSearch.columns.forEach(function(col) {
+                    if (col.join && availableJoins.indexOf(col.join) === -1) {
+                        availableJoins.push(col.join);
+                    }
+                    // Check for period-related columns
+                    if (col.name && (col.name.toLowerCase().indexOf('period') !== -1 || 
+                        col.name.toLowerCase().indexOf('accounting') !== -1)) {
+                        periodColumns.push({
+                            name: col.name,
+                            join: col.join || null,
+                            label: col.label || col.name
+                        });
+                    }
+                });
+            }
+            log.audit('Saved search structure', { 
+                joins: availableJoins,
+                periodColumns: periodColumns,
+                totalColumns: savedSearch.columns ? savedSearch.columns.length : 0
+            });
+            
             // Get original filter count for logging
             var originalFilterCount = savedSearch.filters ? savedSearch.filters.length : 0;
             
             // Parse and add filters from request parameters
+            // Store any filter errors for return in response
+            var filterErrors = [];
             var additionalFilters = parseFilters(requestParams, savedSearch);
+            
+            // Collect any filter errors that occurred during parsing
+            var filterErrors = [];
+            if (requestParams._dateFilterErrors && requestParams._dateFilterErrors.length > 0) {
+                filterErrors = requestParams._dateFilterErrors;
+            }
             
             if (additionalFilters.length > 0) {
                 // Combine existing filters with new filters
@@ -434,7 +607,7 @@ define(['N/search', 'N/log', 'N/format'], function(search, log, format) {
                 filtersApplied: additionalFilters.length
             });
 
-            return {
+            var response = {
                 success: true,
                 searchId: searchId,
                 columns: columns,
@@ -449,7 +622,11 @@ define(['N/search', 'N/log', 'N/format'], function(search, log, format) {
                 // Include filter info for debugging
                 filterInfo: {
                     dateRange: (requestParams.startDate && requestParams.endDate) ? 
-                        { start: requestParams.startDate, end: requestParams.endDate } : null,
+                        { 
+                            start: requestParams.startDate, 
+                            end: requestParams.endDate,
+                            field: requestParams.dateField || 'formuladate'
+                        } : null,
                     department: requestParams.department || null,
                     accountPrefix: requestParams.accountPrefix || null,
                     accountName: requestParams.accountName || null,
@@ -457,19 +634,37 @@ define(['N/search', 'N/log', 'N/format'], function(search, log, format) {
                     subsidiary: requestParams.subsidiary || null
                 }
             };
+            
+            // Add filter errors if any occurred
+            if (filterErrors && filterErrors.length > 0) {
+                response.filterErrors = filterErrors;
+                response.warning = 'Some filters could not be applied. Check filterErrors for details.';
+            }
+            
+            return response;
 
         } catch (e) {
-            log.error('Error executing saved search', {
+            var errorDetails = {
                 message: e.message,
                 name: e.name,
-                stack: e.stack
-            });
+                stack: e.stack,
+                toString: e.toString(),
+                timestamp: new Date().toISOString()
+            };
+            
+            // Try to get more error details if available
+            if (e.toString) {
+                errorDetails.fullError = e.toString();
+            }
+            
+            log.error('Error executing saved search', errorDetails);
             
             return {
                 success: false,
                 error: e.message,
                 errorType: e.name,
-                errorDetails: e.stack
+                errorDetails: e.stack,
+                timestamp: new Date().toISOString()
             };
         }
     }

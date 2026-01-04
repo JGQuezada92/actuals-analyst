@@ -6,12 +6,16 @@ This enables server-side filtering to dramatically reduce data transfer.
 
 The key insight: Instead of fetching 391,000 rows and filtering in Python,
 we send filter parameters to NetSuite and only fetch the matching rows.
+
+Uses accountingPeriod_periodname for date filtering (e.g., "Jan 2024", "Feb 2024")
+to match the export file's "Month-End Date (Text Format)" filter.
 """
 import os
 import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
 from datetime import date
+import calendar
 
 if TYPE_CHECKING:
     from src.core.query_parser import ParsedQuery
@@ -27,10 +31,14 @@ class NetSuiteFilterParams:
     
     These parameters are added to the RESTlet URL query string and
     processed server-side to filter data before pagination.
+    
+    Uses accountingPeriod_periodname for date filtering (e.g., "Jan 2024", "Feb 2024")
+    to match the export file's "Month-End Date (Text Format)" filter.
     """
-    start_date: Optional[str] = None  # MM/DD/YYYY format
-    end_date: Optional[str] = None    # MM/DD/YYYY format
-    date_field: str = "trandate"   # Default to Accounting Posting Date (trandate)
+    period_names: Optional[List[str]] = None  # Accounting period names (e.g., ["Jan 2024", "Feb 2024"])
+    start_date: Optional[str] = None  # MM/DD/YYYY format (fallback if period_names not provided)
+    end_date: Optional[str] = None    # MM/DD/YYYY format (fallback if period_names not provided)
+    date_field: str = "trandate"   # Date field for fallback date filtering (default: trandate)
     departments: List[str] = None
     account_prefixes: List[str] = None
     account_name: Optional[str] = None
@@ -55,7 +63,10 @@ class NetSuiteFilterParams:
         """
         params = {}
         
-        if self.start_date and self.end_date:
+        # Prefer period names over date range
+        if self.period_names:
+            params["periodNames"] = ",".join(self.period_names)
+        elif self.start_date and self.end_date:
             params["startDate"] = self.start_date
             params["endDate"] = self.end_date
             params["dateField"] = self.date_field
@@ -83,7 +94,8 @@ class NetSuiteFilterParams:
     def has_filters(self) -> bool:
         """Check if any filters are set."""
         return bool(
-            self.start_date or
+            self.period_names or
+            (self.start_date and self.end_date) or
             self.departments or
             self.account_prefixes or
             self.account_name or
@@ -95,7 +107,9 @@ class NetSuiteFilterParams:
         """Return human-readable description of filters."""
         parts = []
         
-        if self.start_date and self.end_date:
+        if self.period_names:
+            parts.append(f"Accounting Periods: {', '.join(self.period_names)}")
+        elif self.start_date and self.end_date:
             parts.append(f"Date: {self.start_date} to {self.end_date}")
         
         if self.departments:
@@ -123,6 +137,9 @@ class NetSuiteFilterBuilder:
     This class translates the semantic query understanding (ParsedQuery)
     into concrete NetSuite filter parameters that the RESTlet can apply.
     
+    Uses accountingPeriod_periodname for date filtering (e.g., "Jan 2024", "Feb 2024")
+    to match the export file's "Month-End Date (Text Format)" filter.
+    
     Usage:
         builder = NetSuiteFilterBuilder()
         filter_params = builder.build_from_parsed_query(parsed_query)
@@ -132,14 +149,20 @@ class NetSuiteFilterBuilder:
     # Date format expected by NetSuite
     NETSUITE_DATE_FORMAT = "%m/%d/%Y"
     
+    # Month abbreviations for period name formatting
+    MONTH_ABBREVIATIONS = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    ]
+    
     def __init__(self, date_field: str = "trandate"):
         """
         Initialize the filter builder.
         
         Args:
-            date_field: The date field to filter on. Use "trandate" for
-                       Accounting Posting Date (default) or "formuladate" for
-                       posting period (note: formuladate is not directly filterable).
+            date_field: The date field to use for fallback date filtering
+                       (only used if period names cannot be generated).
+                       Default: "trandate" (Accounting Posting Date).
         """
         self.date_field = date_field
     
@@ -155,14 +178,26 @@ class NetSuiteFilterBuilder:
         """
         params = NetSuiteFilterParams(date_field=self.date_field)
         
-        # Extract date range from time period
+        # Extract accounting period names from time period
         if parsed_query.time_period:
-            params.start_date = self._format_date(parsed_query.time_period.start_date)
-            params.end_date = self._format_date(parsed_query.time_period.end_date)
-            logger.debug(
-                f"Date filter: {params.start_date} to {params.end_date} "
-                f"({parsed_query.time_period.period_name})"
+            period_names = self._date_range_to_period_names(
+                parsed_query.time_period.start_date,
+                parsed_query.time_period.end_date
             )
+            if period_names:
+                params.period_names = period_names
+                logger.debug(
+                    f"Accounting period filter: {', '.join(period_names)} "
+                    f"({parsed_query.time_period.period_name})"
+                )
+            else:
+                # Fallback to date range if period names cannot be generated
+                params.start_date = self._format_date(parsed_query.time_period.start_date)
+                params.end_date = self._format_date(parsed_query.time_period.end_date)
+                logger.debug(
+                    f"Date filter (fallback): {params.start_date} to {params.end_date} "
+                    f"({parsed_query.time_period.period_name})"
+                )
         
         # Extract departments
         if parsed_query.departments:
@@ -222,8 +257,16 @@ class NetSuiteFilterBuilder:
         params = NetSuiteFilterParams(date_field=self.date_field)
         
         if time_period:
-            params.start_date = self._format_date(time_period.start_date)
-            params.end_date = self._format_date(time_period.end_date)
+            period_names = self._date_range_to_period_names(
+                time_period.start_date,
+                time_period.end_date
+            )
+            if period_names:
+                params.period_names = period_names
+            else:
+                # Fallback to date range
+                params.start_date = self._format_date(time_period.start_date)
+                params.end_date = self._format_date(time_period.end_date)
         
         if departments:
             params.departments = list(departments)
@@ -245,6 +288,46 @@ class NetSuiteFilterBuilder:
     def _format_date(self, d: date) -> str:
         """Format a date for NetSuite."""
         return d.strftime(self.NETSUITE_DATE_FORMAT)
+    
+    def _date_range_to_period_names(self, start_date: date, end_date: date) -> List[str]:
+        """
+        Convert a date range to accounting period names.
+        
+        Period names are in format "MMM YYYY" (e.g., "Jan 2024", "Feb 2024").
+        This matches the accountingPeriod_periodname field in NetSuite.
+        
+        Args:
+            start_date: Start date of the range
+            end_date: End date of the range
+        
+        Returns:
+            List of period names covering the date range, or empty list if conversion fails
+        """
+        try:
+            period_names = []
+            current = date(start_date.year, start_date.month, 1)
+            end = date(end_date.year, end_date.month, 1)
+            
+            while current <= end:
+                month_abbr = self.MONTH_ABBREVIATIONS[current.month - 1]
+                period_name = f"{month_abbr} {current.year}"
+                period_names.append(period_name)
+                
+                # Move to next month
+                if current.month == 12:
+                    current = date(current.year + 1, 1, 1)
+                else:
+                    current = date(current.year, current.month + 1, 1)
+            
+            logger.debug(
+                f"Converted date range {start_date} to {end_date} "
+                f"to periods: {', '.join(period_names)}"
+            )
+            return period_names
+            
+        except Exception as e:
+            logger.warning(f"Failed to convert date range to period names: {e}")
+            return []
 
 
 # Factory function
@@ -253,8 +336,10 @@ def get_filter_builder(date_field: Optional[str] = None) -> NetSuiteFilterBuilde
     Get a configured filter builder.
     
     Args:
-        date_field: Optional date field override. If not provided, reads from
-                   NETSUITE_FILTER_DATE_FIELD environment variable (default: "trandate")
+        date_field: Optional date field override for fallback date filtering.
+                   If not provided, reads from NETSUITE_FILTER_DATE_FIELD environment
+                   variable (default: "trandate").
+                   Note: Primary filtering uses accountingPeriod_periodname.
     """
     if date_field is None:
         date_field = os.getenv("NETSUITE_FILTER_DATE_FIELD", "trandate")
