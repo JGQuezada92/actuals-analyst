@@ -154,6 +154,16 @@ class QueryParser:
     # REMOVED: "revenue" (this is an account type, not a department!)
     # REMOVED: "cost of sales", "cogs" (these are handled as account types)
     DEPARTMENT_PATTERNS = [
+        # =========================================================================
+        # COMPOUND PATTERNS - MUST BE FIRST (most specific)
+        # These are handled separately in _extract_departments() before individual patterns
+        # =========================================================================
+        # Note: Compound patterns are processed in _extract_departments() method,
+        # not here. This list is for individual department patterns only.
+        
+        # =========================================================================
+        # INDIVIDUAL PATTERNS - Run after compound patterns
+        # =========================================================================
         # Cost of Sales department team (specific team patterns)
         r"\b(GCC|customer centric engineering)\b",
         
@@ -191,7 +201,7 @@ class QueryParser:
         "last_month": r"\b(last month|prior month|previous month)\b",
         "current_quarter": r"\b(this quarter|current quarter|Q[1-4]\s*(?:FY)?\d{0,4})\b",
         "last_quarter": r"\b(last quarter|prior quarter|previous quarter)\b",
-        "current_year": r"\b(this year|current year|FY\s*\d{2,4})\b",
+        "current_year": r"\b(this year|current year|current fiscal year|this fiscal year|FY\s*\d{2,4})\b",
         "last_year": r"\b(last year|prior year|previous year)\b",
         # Trailing period patterns (TTM, trailing N months)
         "ttm": r"\b(TTM|T12M|trailing\s*12\s*months?|trailing\s*twelve\s*months?|last\s*12\s*months?)\b",
@@ -272,10 +282,48 @@ class QueryParser:
         departments, dept_clarification = self._extract_departments(query, semantic_matched_ranges)
         
         # Merge semantic department filters (avoid duplicates, case-insensitive)
-        if semantic_result.get("departments"):
+        # BUT: If we have compound departments (containing ":"), don't merge individual parts
+        has_compound = any(':' in d for d in departments)
+        
+        if semantic_result.get("departments") and not has_compound:
             existing_lower = [d.lower() for d in departments]
             for dept in semantic_result["departments"]:
-                if dept.lower() not in existing_lower:
+                dept_lower = dept.lower()
+                # Skip if already in list
+                if dept_lower in existing_lower:
+                    continue
+                # Skip if it's a synonym of an existing department (e.g., "Human Resources" when "HR" is already there)
+                is_synonym = False
+                for existing in departments:
+                    existing_lower_check = existing.lower()
+                    # Check if they normalize to the same thing
+                    normalized_existing = self._normalize_department(existing) or existing
+                    normalized_dept = self._normalize_department(dept) or dept
+                    if normalized_existing.lower() == normalized_dept.lower():
+                        is_synonym = True
+                        break
+                    # Also check if one contains the other (e.g., "HR" vs "Human Resources")
+                    if dept_lower in existing_lower_check or existing_lower_check in dept_lower:
+                        # If one is much shorter, it's likely an abbreviation
+                        if abs(len(dept) - len(existing)) > 5:
+                            is_synonym = True
+                            break
+                
+                if not is_synonym:
+                    departments.append(dept)
+                    existing_lower.append(dept_lower)
+        elif semantic_result.get("departments") and has_compound:
+            # We have compound departments - filter out individual parts that are already in compound names
+            existing_lower = [d.lower() for d in departments]
+            for dept in semantic_result["departments"]:
+                # Check if this dept is part of any compound department name
+                is_part_of_compound = False
+                for compound_dept in departments:
+                    if ':' in compound_dept and dept.lower() in compound_dept.lower():
+                        is_part_of_compound = True
+                        break
+                
+                if not is_part_of_compound and dept.lower() not in existing_lower:
                     departments.append(dept)
                     existing_lower.append(dept.lower())
         
@@ -674,8 +722,9 @@ class QueryParser:
         Extract department names from the query.
         
         Uses a tiered approach:
-        1. Static patterns (for well-known patterns like "sales department")
+        1. Compound static patterns (for "G&A (Parent) : Finance" format)
         2. Dynamic registry (for data-discovered departments)
+        3. Individual static patterns (for simple department names)
         
         Args:
             query: The user's query
@@ -687,46 +736,131 @@ class QueryParser:
         departments = []
         clarification_needed = None
         query_lower = query.lower()
+        matched_ranges = list(semantic_matched_ranges) if semantic_matched_ranges else []
         
-        # Step 1: Try static patterns first (existing logic)
-        for pattern in self.DEPARTMENT_PATTERNS:
-            for match in re.finditer(pattern, query, re.IGNORECASE):
-                dept = match.group().strip()
-                start, end = match.span()
+        def is_range_claimed(start: int, end: int) -> bool:
+            """Check if a character range overlaps with already-claimed ranges."""
+            for claimed_start, claimed_end in matched_ranges:
+                if start < claimed_end and end > claimed_start:
+                    return True
+            return False
+        
+        def claim_range(start: int, end: int):
+            """Mark a character range as claimed."""
+            matched_ranges.append((start, end))
+        
+        # =========================================================================
+        # STEP 1: Try COMPOUND patterns first (most specific)
+        # =========================================================================
+        # These patterns match full department paths like "G&A (Parent) : Finance"
+        logger.info(f"Checking compound patterns for query: '{query[:100]}'")
+        compound_patterns = [
+            # Specific parent categories with child (most specific first)
+            r"(g&a\s*\(parent\)\s*:\s*[a-z0-9\s\-&]+?)(?:\s+department|\s+dept|\s*$|\s*\?|\s+expense|\s+cost)",
+            r"(cost\s+of\s+sales\s*\(parent\)\s*:\s*[a-z0-9\s\-&]+?)(?:\s+department|\s+dept|\s*$|\s*\?|\s+expense|\s+cost)",
+            r"(r&d\s*\(parent\)\s*:\s*[a-z0-9\s\-&]+?)(?:\s+department|\s+dept|\s*$|\s*\?|\s+expense|\s+cost)",
+            r"(sales\s*&\s*marketing\s*\(parent\)\s*:\s*[a-z0-9\s\-&]+?)(?:\s+department|\s+dept|\s*$|\s*\?|\s+expense|\s+cost)",
+            # Generic "(Parent) : X" pattern - must start at word boundary
+            # More restrictive: only match if it starts with known parent categories or short phrases
+            r"\b((?:g&a|r&d|cost\s+of\s+sales|sales\s*&\s*marketing|[a-z]{1,15})\s*\(parent\)\s*:\s*[a-z0-9\s\-&]+?)(?:\s+department|\s+dept|\s*$|\s*\?|\s+expense|\s+cost)",
+        ]
+        
+        for pattern_idx, pattern in enumerate(compound_patterns):
+            matches = list(re.finditer(pattern, query_lower, re.IGNORECASE))
+            logger.info(f"Pattern {pattern_idx+1}: Found {len(matches)} matches")
+            for match in matches:
+                dept = match.group(1).strip()
+                start, end = match.span(1)
                 
-                # Special check: "IT" pattern should only match uppercase "IT", not lowercase "it"
-                if pattern.startswith("(?<![a-z])\\bIT\\b") or "\\bIT\\b" in pattern:
-                    # Check if the actual matched text is uppercase "IT"
-                    actual_text = query[start:end]
-                    if actual_text.lower() == "it" and actual_text != "IT":
-                        # Skip lowercase "it" - it's a pronoun, not IT department
-                        logger.debug(f"Skipping lowercase 'it' at position {start}:{end} - pronoun, not IT department")
-                        continue
+                logger.info(f"  Match: '{dept}' at position {start}:{end}")
                 
-                # Check if this match overlaps with a compound semantic term
-                if semantic_matched_ranges:
-                    overlaps = False
-                    for matched_start, matched_end in semantic_matched_ranges:
-                        if not (end <= matched_start or start >= matched_end):
-                            overlaps = True
-                            logger.debug(
-                                f"Skipping department '{dept}' - overlaps with compound term at {matched_start}:{matched_end}"
-                            )
+                # For compound patterns, check if the FULL range is claimed
+                # Allow partial overlaps (e.g., "g&a" and "finance" claimed separately)
+                # but skip if the entire compound pattern range is claimed
+                full_range_claimed = False
+                for claimed_start, claimed_end in matched_ranges:
+                    # If a claimed range fully contains our compound pattern, skip it
+                    if claimed_start <= start and claimed_end >= end:
+                        full_range_claimed = True
+                        logger.info(f"  Range {start}:{end} fully contained in claimed range {claimed_start}:{claimed_end}, skipping")
                             break
-                    if overlaps:
+                
+                if full_range_claimed:
                         continue
                 
-                # Normalize department name (returns None if it's an account term)
-                dept_normalized = self._normalize_department(dept)
+                # Partial overlaps are OK for compound patterns - they take precedence
+                logger.info(f"  Range {start}:{end} has partial overlap but compound pattern takes precedence")
+                
+                # Normalize the department name (proper case)
+                # Convert "g&a (parent) : finance" → "G&A (Parent) : Finance"
+                dept_normalized = self._normalize_compound_department(dept)
+                logger.info(f"  Normalized '{dept}' → '{dept_normalized}'")
+                
                 if dept_normalized and dept_normalized not in departments:
                     departments.append(dept_normalized)
+                    claim_range(start, end)
+                    logger.info(f"  Added to departments: '{dept_normalized}'")
         
-        # Step 2: Try dynamic registry for potential department terms not matched by patterns
-        if self.dynamic_registry and not self.dynamic_registry.is_empty():
+        # If we found compound departments, clean up and return
+        # Remove any invalid matches (e.g., ones that include extra words)
+        if departments:
+            # Keep only valid compound department names (should contain ":")
+            # Filter out matches that include extra words before the department name
+            valid_departments = []
+            for d in departments:
+                if ':' in d:
+                    # Check if it starts with common query words (invalid)
+                    invalid_prefixes = ['what', 'is', 'the', 'total', 'expense', 'for', 'fiscal', 'year']
+                    dept_lower = d.lower()
+                    if any(dept_lower.startswith(prefix + ' ') for prefix in invalid_prefixes):
+                        logger.debug(f"Filtered out invalid match: '{d}' (starts with query word)")
+                        continue
+                    # Check if it's a reasonable compound department (parent : child format)
+                    if ' (parent)' in dept_lower or ' (Parent)' in d:
+                        valid_departments.append(d)
+                    else:
+                        logger.debug(f"Filtered out invalid match: '{d}' (not proper compound format)")
+            
+            if valid_departments:
+                # Remove duplicates while preserving order
+                seen = set()
+                unique_departments = []
+                for d in valid_departments:
+                    d_lower = d.lower()
+                    if d_lower not in seen:
+                        seen.add(d_lower)
+                        unique_departments.append(d)
+                
+                logger.info(f"Extracted compound departments: {unique_departments}")
+                return unique_departments, clarification_needed
+            # If no valid ones, clear and continue to registry/individual patterns
+            departments = []
+        
+        # =========================================================================
+        # STEP 2: Try dynamic registry for compound terms ONLY if query has compound patterns
+        # =========================================================================
+        # Only use registry for compound lookups if the query contains compound patterns
+        # For simple queries like "IT and HR", prefer static patterns over registry compound matches
+        has_compound_pattern_in_query = bool(re.search(r'\(parent\)\s*:', query_lower, re.IGNORECASE))
+        
+        if DYNAMIC_REGISTRY_AVAILABLE and self.dynamic_registry and not self.dynamic_registry.is_empty() and has_compound_pattern_in_query:
+            try:
+                # Use the registry's lookup method to find matches
+                # Try looking up potential compound terms from the query
             potential_terms = self._extract_potential_entity_terms(query, semantic_matched_ranges)
             
-            for term in potential_terms:
-                # Skip if already matched by static patterns
+                # Also try looking up the full query phrase for compound departments
+                # Extract phrases that look like "G&A (Parent) : Finance"
+                compound_phrases = re.findall(
+                    r'([a-z&\s]+\(parent\)\s*:\s*[a-z0-9\s\-&]+)',
+                    query_lower,
+                    re.IGNORECASE
+                )
+                
+                all_terms = list(set(potential_terms + compound_phrases))
+                
+                for term in all_terms:
+                    # Skip if already matched
                 if any(term.lower() in d.lower() for d in departments):
                     continue
                 
@@ -737,10 +871,49 @@ class QueryParser:
                     for dept in resolved:
                         if dept not in departments:
                             departments.append(dept)
+                                # If we matched a compound name, we're done
+                                if ':' in dept:
+                                    logger.info(f"Extracted compound department from registry: {departments}")
+                                    return departments, clarification_needed
                 elif clarification:
                     # Multiple matches found - need clarification
                     clarification_needed = clarification
-                    # Don't add to departments yet - wait for user response
+            except Exception as e:
+                logger.warning(f"Dynamic registry lookup failed: {e}")
+        
+        # If we found departments from registry, return them
+        if departments:
+            logger.info(f"Extracted departments from registry: {departments}")
+            return departments, clarification_needed
+        
+        # =========================================================================
+        # STEP 3: Fall back to individual static patterns
+        # =========================================================================
+        # Only run this if no compound or registry matches found
+        for pattern in self.DEPARTMENT_PATTERNS:
+            for match in re.finditer(pattern, query, re.IGNORECASE):
+                dept = match.group().strip()
+                start, end = match.span()
+                
+                # Skip if already claimed
+                if is_range_claimed(start, end):
+                    continue
+                
+                # Special check: "IT" pattern should only match uppercase "IT", not lowercase "it"
+                if pattern.startswith("(?<![a-z])\\bIT\\b") or "\\bIT\\b" in pattern:
+                    actual_text = query[start:end]
+                    if actual_text.lower() == "it" and actual_text != "IT":
+                        continue
+                
+                # Normalize department name (returns None if it's an account term)
+                dept_normalized = self._normalize_department(dept)
+                if dept_normalized and dept_normalized not in departments:
+                    departments.append(dept_normalized)
+                    claim_range(start, end)
+                    logger.debug(f"Static pattern matched: '{dept}' → '{dept_normalized}'")
+        
+        if departments:
+            logger.info(f"Extracted departments via static patterns: {departments}")
         
         return departments, clarification_needed
     
@@ -965,6 +1138,84 @@ class QueryParser:
         }
         
         return mappings.get(dept_lower, dept)
+    
+    def _normalize_compound_department(self, dept: str) -> str:
+        """
+        Normalize a compound department name to proper format.
+        
+        Converts "g&a (parent) : finance" → "G&A (Parent) : Finance"
+        """
+        if not dept:
+            return ""
+        
+        # Split on " : " or ":"
+        if ':' in dept:
+            parts = dept.split(':')
+            normalized_parts = []
+            
+            for part in parts:
+                part = part.strip()
+                
+                # Handle special cases
+                part_upper = part.upper()
+                if 'G&A' in part_upper or part_upper.startswith('G&A'):
+                    # Keep G&A uppercase, handle (Parent)
+                    part = re.sub(r'g&a', 'G&A', part, flags=re.IGNORECASE)
+                    part = re.sub(r'\(parent\)', '(Parent)', part, flags=re.IGNORECASE)
+                elif 'R&D' in part_upper:
+                    part = re.sub(r'r&d', 'R&D', part, flags=re.IGNORECASE)
+                    part = re.sub(r'\(parent\)', '(Parent)', part, flags=re.IGNORECASE)
+                elif 'COST OF SALES' in part_upper:
+                    part = 'Cost of Sales' + part[len('cost of sales'):]
+                    part = re.sub(r'\(parent\)', '(Parent)', part, flags=re.IGNORECASE)
+                elif 'SALES & MARKETING' in part_upper or 'SALES AND MARKETING' in part_upper:
+                    part = re.sub(r'sales\s*[&and]+\s*marketing', 'Sales & Marketing', part, flags=re.IGNORECASE)
+                    part = re.sub(r'\(parent\)', '(Parent)', part, flags=re.IGNORECASE)
+                else:
+                    # Title case for other parts
+                    part = part.title()
+                    part = re.sub(r'\(Parent\)', '(Parent)', part, flags=re.IGNORECASE)
+                
+                normalized_parts.append(part)
+            
+            return ' : '.join(normalized_parts)
+        
+        return dept.strip()
+    
+    def _normalize_department_name(self, dept: str) -> str:
+        """
+        Normalize an individual department name.
+        
+        Handles special cases like G&A, R&D, IT, etc.
+        """
+        if not dept:
+            return ""
+        
+        dept = dept.strip()
+        dept_upper = dept.upper()
+        
+        # Special abbreviations that should stay uppercase
+        if dept_upper in ['G&A', 'R&D', 'IT', 'HR', 'SDR', 'FP&A', 'CS', 'PM']:
+            return dept_upper
+        
+        # Handle "general and administrative" → "G&A"
+        if 'general' in dept.lower() and 'admin' in dept.lower():
+            return 'G&A'
+        
+        # Handle "research and development" → "R&D"  
+        if 'research' in dept.lower() and 'development' in dept.lower():
+            return 'R&D'
+        
+        # Handle "human resources" → "HR"
+        if 'human' in dept.lower() and 'resource' in dept.lower():
+            return 'HR'
+        
+        # Handle "sales development" → "SDR"
+        if 'sales' in dept.lower() and 'development' in dept.lower():
+            return 'SDR'
+        
+        # Default: title case
+        return dept.title()
     
     def _extract_accounts(self, query: str) -> List[str]:
         """Extract account names or numbers from the query."""
