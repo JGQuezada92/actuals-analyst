@@ -16,10 +16,19 @@ aiohttp>=3.9.0                # For parallel/async HTTP requests
 
 # Data Processing
 pandas>=2.0.0                 # Optional: for advanced data manipulation
+numpy>=1.24.0                 # Required for statistical analysis
+
+# Statistical Analysis
+statsmodels>=0.14.0           # Time series, regression, seasonality
+arch>=6.0.0                   # ARCH/GARCH volatility modeling
+scipy>=1.11.0                 # Statistical functions and tests
 
 # Visualization
 matplotlib>=3.7.0
 seaborn>=0.12.0               # Optional: enhanced styling
+
+# Excel Output
+openpyxl>=3.1.0               # Excel workbook generation with charts
 
 # Utilities
 python-dotenv>=1.0.0          # Environment variable management

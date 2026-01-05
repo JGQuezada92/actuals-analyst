@@ -52,6 +52,9 @@ class QueryIntent(Enum):
     TOP_N = "top_n"               # Top/bottom N items
     DETAIL = "detail"             # Detailed line items
     RATIO = "ratio"               # Ratio/percentage analysis
+    CORRELATION = "correlation"   # Correlation analysis
+    REGRESSION = "regression"     # Regression analysis
+    VOLATILITY = "volatility"     # Volatility/ARCH analysis
 
 class ComparisonType(Enum):
     """Type of comparison requested."""
@@ -228,6 +231,9 @@ class QueryParser:
         QueryIntent.TOTAL: r"\b(total|sum|aggregate|overall|grand)\b",
         QueryIntent.RATIO: r"\b(ratio|percent(?:age)?|proportion|relative\s*to|as\s*(?:a\s*)?%)\b",
         QueryIntent.SUMMARY: r"\b(summary|summarize|overview|snapshot|highlights?)\b",
+        QueryIntent.CORRELATION: r"\b(correlat\w*|relationship|driver|drives?|affects?|impacts?|predicts?|most closely|best predict|strongest relationship|which\s+\w+\s+(?:affect|impact|drive|correlate))\b",
+        QueryIntent.REGRESSION: r"\b(regress\w*|coefficient|beta|r-squared|significance|model|predict\w*|explanatory|independent variable)\b",
+        QueryIntent.VOLATILITY: r"\b(volatil\w*|arch|garch|variance|risk|uncertainty|clustering|heteroskedastic\w*|conditional variance|time-varying variance)\b",
     }
     
     def __init__(self, fiscal_calendar: FiscalCalendar = None, llm_router = None):
@@ -553,9 +559,24 @@ class QueryParser:
     
     def _extract_intent(self, query: str) -> QueryIntent:
         """Extract the primary intent from the query."""
+        # Prioritize statistical intents first (they're more specific)
+        statistical_intents = [
+            QueryIntent.CORRELATION,
+            QueryIntent.REGRESSION,
+            QueryIntent.VOLATILITY,
+        ]
+        
+        for intent in statistical_intents:
+            if intent in self.INTENT_PATTERNS:
+                pattern = self.INTENT_PATTERNS[intent]
+                if re.search(pattern, query, re.IGNORECASE):
+                    return intent
+        
+        # Then check other intents
         for intent, pattern in self.INTENT_PATTERNS.items():
-            if re.search(pattern, query, re.IGNORECASE):
-                return intent
+            if intent not in statistical_intents:  # Skip already checked
+                if re.search(pattern, query, re.IGNORECASE):
+                    return intent
         
         # Default to summary if no specific intent detected
         return QueryIntent.SUMMARY
@@ -783,10 +804,10 @@ class QueryParser:
                     if claimed_start <= start and claimed_end >= end:
                         full_range_claimed = True
                         logger.info(f"  Range {start}:{end} fully contained in claimed range {claimed_start}:{claimed_end}, skipping")
-                            break
+                        break
                 
                 if full_range_claimed:
-                        continue
+                    continue
                 
                 # Partial overlaps are OK for compound patterns - they take precedence
                 logger.info(f"  Range {start}:{end} has partial overlap but compound pattern takes precedence")
@@ -847,7 +868,7 @@ class QueryParser:
             try:
                 # Use the registry's lookup method to find matches
                 # Try looking up potential compound terms from the query
-            potential_terms = self._extract_potential_entity_terms(query, semantic_matched_ranges)
+                potential_terms = self._extract_potential_entity_terms(query, semantic_matched_ranges)
             
                 # Also try looking up the full query phrase for compound departments
                 # Extract phrases that look like "G&A (Parent) : Finance"
@@ -861,23 +882,23 @@ class QueryParser:
                 
                 for term in all_terms:
                     # Skip if already matched
-                if any(term.lower() in d.lower() for d in departments):
-                    continue
-                
-                # Check dynamic registry
-                resolved, clarification = self._resolve_entity_dynamic(term, EntityType.DEPARTMENT)
-                
-                if resolved:
-                    for dept in resolved:
-                        if dept not in departments:
-                            departments.append(dept)
+                    if any(term.lower() in d.lower() for d in departments):
+                        continue
+                    
+                    # Check dynamic registry
+                    resolved, clarification = self._resolve_entity_dynamic(term, EntityType.DEPARTMENT)
+                    
+                    if resolved:
+                        for dept in resolved:
+                            if dept not in departments:
+                                departments.append(dept)
                                 # If we matched a compound name, we're done
                                 if ':' in dept:
                                     logger.info(f"Extracted compound department from registry: {departments}")
                                     return departments, clarification_needed
-                elif clarification:
-                    # Multiple matches found - need clarification
-                    clarification_needed = clarification
+                    elif clarification:
+                        # Multiple matches found - need clarification
+                        clarification_needed = clarification
             except Exception as e:
                 logger.warning(f"Dynamic registry lookup failed: {e}")
         

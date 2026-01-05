@@ -32,6 +32,13 @@ from src.tools.netsuite_client import NetSuiteDataRetriever, SavedSearchResult, 
 from src.tools.calculator import FinancialCalculator, CalculationResult, get_calculator, MetricType
 from src.tools.charts import ChartGenerator, ChartOutput, get_chart_generator
 from src.tools.data_processor import DataProcessor, FilterResult, get_data_processor
+from src.tools.statistical_analyzer import (
+    StatisticalAnalyzer,
+    CorrelationAnalysis,
+    RegressionResult,
+    ARCHResult,
+    get_statistical_analyzer
+)
 from src.evaluation.evaluator import (
     EvaluationHarness, EvaluationResult, 
     get_evaluation_harness
@@ -62,6 +69,10 @@ class AnalysisContext:
     analysis_text: str = ""
     evaluation: Optional[EvaluationResult] = None
     iteration_count: int = 0
+    
+    # Statistical analysis (NEW)
+    statistical_analysis: Optional[Dict[str, Any]] = None
+    statistical_context: str = ""
     
     @property
     def working_data(self) -> List[Dict[str, Any]]:
@@ -163,8 +174,20 @@ the data provided.
 ## Data by Category (if applicable)
 {category_breakdown}
 
+{statistical_context}
+
 Provide a comprehensive analysis following the structure in your instructions.
 Remember: Use the pre-calculated metrics exactly as provided - do not recalculate.
+
+When interpreting statistical results:
+1. Focus on statistically significant correlations (p < 0.05)
+2. Explain correlation vs causation distinction
+3. Note the lag if correlations are lagged
+4. Mention seasonality adjustments made
+5. Interpret ARCH results in terms of revenue volatility patterns
+
+IMPORTANT: Statistical significance does not imply causation. Present correlations 
+as "associated with" not "causes" unless there's clear causal reasoning.
 """
     
     def __init__(
@@ -180,6 +203,7 @@ Remember: Use the pre-calculated metrics exactly as provided - do not recalculat
         session_manager: Optional[SessionManager] = None,
         data_context: Optional[DataContext] = None,
         cost_estimator: Optional[QueryCostEstimator] = None,
+        statistical_analyzer: Optional[StatisticalAnalyzer] = None,
     ):
         self.data_retriever = data_retriever or get_data_retriever()
         self.calculator = calculator or get_calculator()
@@ -192,6 +216,9 @@ Remember: Use the pre-calculated metrics exactly as provided - do not recalculat
         self.session_manager = session_manager or get_session_manager()
         self.data_context = data_context or get_data_context()
         self.cost_estimator = cost_estimator or get_query_cost_estimator()
+        self.statistical_analyzer = statistical_analyzer or get_statistical_analyzer(
+            fiscal_start_month=self.fiscal_calendar.fy_start_month
+        )
         self.config = get_config()
     
     async def analyze(
@@ -264,6 +291,10 @@ Remember: Use the pre-calculated metrics exactly as provided - do not recalculat
         
         # Phase 2: Deterministic Calculations (now with fiscal awareness)
         context = self._perform_calculations(context)
+        
+        # Phase 2.5: Statistical Analysis (if requested)
+        if parsed_query.intent in [QueryIntent.CORRELATION, QueryIntent.REGRESSION, QueryIntent.VOLATILITY]:
+            context = self._run_statistical_analysis(context)
         
         # Phase 3: Chart Generation
         if include_charts:
@@ -615,6 +646,43 @@ Remember: Use the pre-calculated metrics exactly as provided - do not recalculat
         
         return context
     
+    def _run_statistical_analysis(self, context: AnalysisContext) -> AnalysisContext:
+        """Phase 2.5: Run statistical analysis if query requires it."""
+        logger.info("Phase 2.5: Running statistical analysis")
+        
+        parsed = context.parsed_query
+        if not parsed:
+            return context
+        
+        # Check if query mentions seasonality or ARCH
+        query_lower = context.query.lower()
+        include_arch = "arch" in query_lower or "garch" in query_lower or parsed.intent == QueryIntent.VOLATILITY
+        seasonally_adjust = "season" in query_lower or parsed.intent == QueryIntent.CORRELATION
+        
+        try:
+            # Run full correlation analysis
+            result = self.statistical_analyzer.full_revenue_correlation_analysis(
+                data=context.working_data,
+                include_arch=include_arch,
+                seasonally_adjust=seasonally_adjust,
+                top_n=10
+            )
+            
+            context.statistical_analysis = result
+            context.statistical_context = result.get("llm_context", "")
+            
+            # Log completion
+            corr_analysis = result.get("correlation_analysis")
+            if corr_analysis and hasattr(corr_analysis, 'correlations'):
+                logger.info(f"Statistical analysis completed: {len(corr_analysis.correlations)} correlations found")
+            else:
+                logger.info("Statistical analysis completed (no correlations found)")
+        except Exception as e:
+            logger.error(f"Statistical analysis error: {e}", exc_info=True)
+            context.statistical_context = f"Statistical analysis encountered an error: {str(e)}"
+        
+        return context
+    
     def _generate_charts(self, context: AnalysisContext) -> AnalysisContext:
         """Phase 3: Generate visualizations."""
         logger.info("Phase 3: Generating charts")
@@ -651,6 +719,31 @@ Remember: Use the pre-calculated metrics exactly as provided - do not recalculat
                 if 'date' in col.lower():
                     date_field = col
                     break
+        
+        # NEW: Generate quarterly trend chart if sufficient data
+        if amount_field and date_field and self.chart_generator:
+            try:
+                quarterly_data = self.data_processor.aggregate_to_quarters(
+                    data,
+                    amount_field=amount_field,
+                    date_field=date_field,
+                    fiscal_start_month=self.fiscal_calendar.fy_start_month,
+                )
+                
+                if len(quarterly_data) >= 4:
+                    quarters = [q["quarter_label"] for q in quarterly_data]
+                    amounts = [q["amount"] for q in quarterly_data]
+                    
+                    chart = self.chart_generator.quarterly_trend_chart(
+                        quarters=quarters,
+                        values=amounts,
+                        title="Quarterly Trend Analysis",
+                        ylabel="Amount ($)",
+                        show_yoy_change=len(quarterly_data) >= 8,  # Need 2 years for YoY
+                    )
+                    charts.append(chart)
+            except Exception as e:
+                logger.debug(f"Could not generate quarterly chart: {e}")
         
         # Generate category breakdown chart
         if amount_field and category_field:
@@ -762,6 +855,11 @@ Remember: Use the pre-calculated metrics exactly as provided - do not recalculat
         # Get data interpretation context from configuration
         data_context_info = self.data_context.get_llm_context_summary()
         
+        # Prepare statistical context
+        statistical_context = context.statistical_context if context.statistical_context else ""
+        if statistical_context:
+            statistical_context = f"\n## Statistical Analysis Results\n{statistical_context}\n"
+        
         prompt = self.ANALYSIS_PROMPT.format(
             query=query_context,
             row_count=len(context.working_data),
@@ -770,6 +868,7 @@ Remember: Use the pre-calculated metrics exactly as provided - do not recalculat
             calculations=calc_summary or "No calculations available",
             sample_data=sample_data,
             category_breakdown=category_breakdown or "No category breakdown available",
+            statistical_context=statistical_context,
         )
         
         # Add data context, conversation context, and parsed info to prompt

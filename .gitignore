@@ -26,6 +26,7 @@ logs/
 # Cache
 .cache/
 .charts/
+.outputs/
 *.cache
 
 # Test
@@ -45,7 +46,7 @@ build/
 # Test Data Files (may contain sensitive information)
 *.xls
 *.xlsx
-PlanfulTestTransactionDetailJGQResults547.xls
+PlanfulTestTransactionDetail*.xls*
 
 # Validation output files
 ground_truth_*.json

@@ -1581,6 +1581,15 @@ class NetSuiteDataRetriever:
         Returns:
             SavedSearchResult with validated data.
         """
+        import os
+        
+        # Check if mock data mode is enabled
+        use_mock_data = os.getenv("USE_MOCK_DATA", "false").lower() == "true"
+        
+        if use_mock_data:
+            logger.info("Using MOCK DATA mode - generating fake NetSuite data")
+            return self._get_mock_data(parsed_query=parsed_query)
+        
         search_id = search_id or self.config.saved_search_id
         
         # Generate cache key based on query parameters
@@ -1615,6 +1624,81 @@ class NetSuiteDataRetriever:
             self.cache.set(result)
         
         return result
+    
+    def _get_mock_data(self, parsed_query: Optional['ParsedQuery'] = None) -> SavedSearchResult:
+        """
+        Generate mock NetSuite data for testing without exposing real financial data.
+        
+        Args:
+            parsed_query: Optional ParsedQuery to apply filters to mock data generation
+        
+        Returns:
+            SavedSearchResult with mock data
+        """
+        from src.tools.mock_data_generator import (
+            generate_mock_netsuite_data,
+            get_mock_column_names,
+        )
+        from src.core.netsuite_filter_builder import get_filter_builder
+        
+        # Determine parameters from parsed_query
+        periods = None
+        departments = None
+        account_prefixes = None
+        row_count = 1000  # Default row count
+        
+        if parsed_query:
+            # Extract period names using filter builder's helper method
+            if parsed_query.time_period:
+                filter_builder = get_filter_builder()
+                period_names = filter_builder._date_range_to_period_names(
+                    parsed_query.time_period.start_date,
+                    parsed_query.time_period.end_date
+                )
+                if period_names:
+                    periods = period_names
+            
+            # Extract departments
+            if parsed_query.departments:
+                departments = parsed_query.departments
+            
+            # Extract account prefixes
+            if parsed_query.account_type_filter:
+                if parsed_query.account_type_filter.get("filter_type") == "prefix":
+                    account_prefixes = parsed_query.account_type_filter.get("values", [])
+            
+            # Estimate row count based on filters (more specific = fewer rows)
+            if periods and departments and account_prefixes:
+                row_count = 500
+            elif periods or departments or account_prefixes:
+                row_count = 750
+            else:
+                row_count = 1000
+        
+        # Generate mock data
+        mock_data = generate_mock_netsuite_data(
+            row_count=row_count,
+            periods=periods,
+            departments=departments,
+            account_prefixes=account_prefixes,
+        )
+        
+        column_names = get_mock_column_names()
+        
+        logger.info(
+            f"Generated {len(mock_data)} mock transactions "
+            f"(periods: {periods or 'all'}, depts: {departments or 'all'}, "
+            f"accounts: {account_prefixes or 'all'})"
+        )
+        
+        return SavedSearchResult(
+            data=mock_data,
+            search_id="mock_search",
+            retrieved_at=datetime.utcnow(),
+            row_count=len(mock_data),
+            column_names=column_names,
+            execution_time_ms=10.0,  # Mock execution time
+        )
     
     def _generate_cache_key(
         self,

@@ -26,6 +26,10 @@ class MetricType(Enum):
     CASH_FLOW = "cash_flow"
     TREND = "trend"
     VARIANCE = "variance"
+    CORRELATION = "correlation"
+    REGRESSION = "regression"
+    VOLATILITY = "volatility"
+    SEASONALITY = "seasonality"
 
 @dataclass
 class CalculationResult:

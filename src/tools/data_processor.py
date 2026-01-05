@@ -874,6 +874,102 @@ class DataProcessor:
             row_count=len(result),
         )
     
+    def aggregate_to_quarters(
+        self,
+        data: List[Dict],
+        amount_field: str = None,
+        date_field: str = None,
+        group_by: str = None,
+        fiscal_start_month: int = 2,
+    ) -> List[Dict[str, Any]]:
+        """
+        Aggregate data to fiscal quarters.
+        
+        Args:
+            data: Source data rows
+            amount_field: Field containing amounts
+            date_field: Field containing dates
+            group_by: Optional field for additional grouping
+            fiscal_start_month: Month fiscal year starts (2 = February)
+        
+        Returns:
+            List of dicts with quarter, amount, and optional group
+        """
+        from collections import defaultdict
+        
+        amount_field = amount_field or self.find_field(data, "amount")
+        date_field = date_field or self.find_field(data, "date")
+        
+        def get_fiscal_quarter(date_val: Any) -> Optional[Tuple[int, int, str]]:
+            """Returns (fiscal_year, quarter_num, label)."""
+            try:
+                row_date = self._parse_date(date_val)
+                if not row_date:
+                    return None
+                
+                month = row_date.month
+                year = row_date.year
+                
+                # Adjust for fiscal year
+                if month < fiscal_start_month:
+                    fiscal_year = year
+                else:
+                    fiscal_year = year + 1
+                
+                # Calculate quarter (1-indexed from fiscal start)
+                months_from_start = (month - fiscal_start_month) % 12
+                quarter = (months_from_start // 3) + 1
+                
+                # Create label like "Q1'24" or "Q3 FY24"
+                label = f"Q{quarter}'{str(fiscal_year)[-2:]}"
+                
+                return (fiscal_year, quarter, label)
+            except Exception:
+                return None
+        
+        # Aggregate
+        if group_by:
+            aggregated = defaultdict(lambda: defaultdict(float))
+            for row in data:
+                quarter_info = get_fiscal_quarter(row.get(date_field))
+                if quarter_info:
+                    fy, q, label = quarter_info
+                    group = str(row.get(group_by, "Other"))
+                    amount = self._parse_amount(row.get(amount_field, 0))
+                    aggregated[(fy, q, label)][group] += amount
+            
+            # Flatten
+            results = []
+            for (fy, q, label), groups in sorted(aggregated.items()):
+                for group, amount in groups.items():
+                    results.append({
+                        "fiscal_year": fy,
+                        "quarter": q,
+                        "quarter_label": label,
+                        group_by: group,
+                        "amount": amount,
+                    })
+            return results
+        else:
+            aggregated = defaultdict(float)
+            for row in data:
+                quarter_info = get_fiscal_quarter(row.get(date_field))
+                if quarter_info:
+                    fy, q, label = quarter_info
+                    amount = self._parse_amount(row.get(amount_field, 0))
+                    aggregated[(fy, q, label)] += amount
+            
+            # Sort and return
+            return [
+                {
+                    "fiscal_year": fy,
+                    "quarter": q,
+                    "quarter_label": label,
+                    "amount": amount,
+                }
+                for (fy, q, label), amount in sorted(aggregated.items())
+            ]
+    
     def group_by_multiple(
         self,
         data: List[Dict],
