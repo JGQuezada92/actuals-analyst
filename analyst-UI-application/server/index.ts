@@ -32,6 +32,8 @@ const io = new SocketIOServer(httpServer, {
     methods: ['GET', 'POST'],
     credentials: true,
   },
+  transports: ['polling', 'websocket'], // Allow both transports
+  allowEIO3: true, // Support older Socket.IO clients
 });
 
 // Initialize services

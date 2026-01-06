@@ -76,6 +76,9 @@ class AnalysisContext:
     statistical_analysis: Optional[Dict[str, Any]] = None
     statistical_context: str = ""
     
+    # Trace ID for observability
+    trace_id: Optional[str] = None
+    
     @property
     def working_data(self) -> List[Dict[str, Any]]:
         """Get the data to work with (filtered or raw)."""
@@ -108,6 +111,7 @@ class AgentResponse:
     clarification_message: Optional[str] = None
     ambiguous_terms: List[str] = field(default_factory=list)
     pending_query: Optional[str] = None
+    trace_id: Optional[str] = None
     
     @property
     def slack_formatted(self) -> str:
@@ -211,6 +215,7 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         
         with tracer.start_trace(query, user_id=user_id, session_id=session_id, channel=channel) as trace:
             logger.info(f"Starting analysis for query: {query[:100]}...")
+            trace_id = trace.trace_id if trace else None
             
             # Get or create session for conversation memory
             if session is None and session_id:
@@ -624,6 +629,56 @@ as "associated with" not "causes" unless there's clear causal reasoning.
                     )
                     calculations.append(comparison)
             
+            # Monthly breakdown if query requests monthly totals
+            query_lower = context.query.lower()
+            is_monthly_query = (
+                "monthly" in query_lower or 
+                "by month" in query_lower or 
+                "each month" in query_lower or
+                "per month" in query_lower
+            )
+            
+            if is_monthly_query and date_field:
+                logger.info("Detected monthly query - generating monthly breakdown")
+                monthly_breakdown = self.data_processor.group_by_period(
+                    data=data,
+                    period_type="month",
+                    amount_field=amount_field,
+                    date_field=date_field
+                )
+                
+                if monthly_breakdown.data:
+                    # Create calculation results for each month
+                    for month_key, month_data in sorted(monthly_breakdown.data.items()):
+                        month_total = month_data.get("sum", 0)
+                        month_count = month_data.get("count", 0)
+                        
+                        # Format month key (e.g., "2025-02" -> "February 2025")
+                        try:
+                            year, month_num = month_key.split("-")
+                            month_name = datetime(int(year), int(month_num), 1).strftime("%B %Y")
+                        except:
+                            month_name = month_key
+                        
+                        calculations.append(CalculationResult(
+                            metric_name=f"{month_name} Total",
+                            value=month_total,
+                            formatted_value=f"${month_total:,.2f}",
+                            metric_type=MetricType.CASH_FLOW,
+                            inputs={
+                                "month": month_key,
+                                "transaction_count": month_count,
+                                "field": amount_field
+                            },
+                            formula=f"Sum of {amount_field} for {month_key}",
+                            interpretation_guide=(
+                                f"Total for {month_name} is ${month_total:,.2f} "
+                                f"across {month_count} transactions."
+                            ),
+                        ))
+                    
+                    logger.info(f"Generated {len(monthly_breakdown.data)} monthly calculations")
+            
             # Trend analysis if date field exists
             if date_field:
                 trend = self.calculator.time_series_trend(data, amount_field, date_field)
@@ -973,6 +1028,7 @@ the data provided.
                 "parsed_intent": context.parsed_query.intent.value if context.parsed_query else None,
                 "filter_summary": context.filter_summary,
             },
+            trace_id=context.trace_id,
         )
 
 def get_financial_analyst() -> FinancialAnalystAgent:

@@ -52,6 +52,8 @@ def cmd_slack(args):
 def cmd_analyze(args):
     """Run a one-off analysis."""
     import asyncio
+    import json
+    import os
     from src.agents.financial_analyst import get_financial_analyst
     
     query = args.query
@@ -64,34 +66,59 @@ def cmd_analyze(args):
         max_iterations=args.iterations,
     ))
     
-    # Print results
-    print("\n" + "="*60)
-    print("ANALYSIS RESULTS")
-    print("="*60)
-    print(response.analysis)
-    print("\n" + "-"*60)
-    print("METRICS")
-    print("-"*60)
-    for calc in response.calculations[:10]:
-        print(f"  {calc['metric_name']}: {calc['formatted_value']}")
+    # Check if JSON output is requested (for UI integration)
+    output_json = os.getenv("JSON_OUTPUT", "false").lower() == "true" or getattr(args, 'json', False)
     
-    if response.charts:
+    if output_json:
+        # Output JSON for UI consumption
+        result = {
+            "analysis": response.analysis,
+            "calculations": response.calculations,
+            "charts": [
+                {
+                    "title": chart.title,
+                    "file_path": chart.file_path,
+                    "chart_type": chart.chart_type,
+                    "alt_text": chart.alt_text,
+                }
+                for chart in response.charts
+            ],
+            "evaluation_summary": response.evaluation_summary,
+            "metadata": response.metadata,
+            "trace_id": response.metadata.get("trace_id") if hasattr(response, 'metadata') else None,
+        }
+        print("```json")
+        print(json.dumps(result, indent=2, default=str))
+        print("```")
+    else:
+        # Print results in human-readable format
+        print("\n" + "="*60)
+        print("ANALYSIS RESULTS")
+        print("="*60)
+        print(response.analysis)
         print("\n" + "-"*60)
-        print("GENERATED CHARTS")
+        print("METRICS")
         print("-"*60)
-        for chart in response.charts:
-            print(f"  {chart.title}: {chart.file_path}")
-    
-    print("\n" + "-"*60)
-    print("EVALUATION")
-    print("-"*60)
-    eval_summary = response.evaluation_summary
-    print(f"  Passes Threshold: {eval_summary.get('passes_threshold')}")
-    print(f"  Qualitative Score: {eval_summary.get('qualitative_score')}/10")
-    if eval_summary.get('suggestions'):
-        print("  Suggestions:")
-        for s in eval_summary['suggestions'][:3]:
-            print(f"    - {s}")
+        for calc in response.calculations[:10]:
+            print(f"  {calc['metric_name']}: {calc['formatted_value']}")
+        
+        if response.charts:
+            print("\n" + "-"*60)
+            print("GENERATED CHARTS")
+            print("-"*60)
+            for chart in response.charts:
+                print(f"  {chart.title}: {chart.file_path}")
+        
+        print("\n" + "-"*60)
+        print("EVALUATION")
+        print("-"*60)
+        eval_summary = response.evaluation_summary
+        print(f"  Passes Threshold: {eval_summary.get('passes_threshold')}")
+        print(f"  Qualitative Score: {eval_summary.get('qualitative_score')}/10")
+        if eval_summary.get('suggestions'):
+            print("  Suggestions:")
+            for s in eval_summary['suggestions'][:3]:
+                print(f"    - {s}")
 
 def cmd_test(args):
     """Run evaluation tests."""

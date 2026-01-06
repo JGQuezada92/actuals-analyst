@@ -2,6 +2,7 @@ import { ChatMessage } from '@/types';
 import { cn } from '@/lib/utils';
 import { User, Bot, AlertCircle, ExternalLink, CheckCircle } from 'lucide-react';
 import { CalculationCard } from './calculation-card';
+import { AnalysisFormatter } from './analysis-formatter';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -39,11 +40,11 @@ export function MessageBubble({ message }: MessageBubbleProps) {
         {/* Message bubble */}
         <Card
           className={cn(
-            'px-4 py-3 shadow-sm',
+            'shadow-sm',
             isUser
-              ? 'bg-emerald-600 text-white border-emerald-600'
-              : 'bg-white border-gray-200',
-            isError && 'bg-red-50 border-red-200 text-red-700'
+              ? 'bg-emerald-600 text-white border-emerald-600 px-4 py-3'
+              : 'bg-white border-gray-200 p-0',
+            isError && 'bg-red-50 border-red-200 text-red-700 px-4 py-3'
           )}
         >
           {isError && (
@@ -52,9 +53,20 @@ export function MessageBubble({ message }: MessageBubbleProps) {
               <span className="font-medium">Error</span>
             </div>
           )}
-          <p className="whitespace-pre-wrap text-sm leading-relaxed">
-            {isError ? message.content.replace('Error: ', '') : message.content}
-          </p>
+          
+          {isError ? (
+            <p className="whitespace-pre-wrap text-sm leading-relaxed">
+              {message.content.replace('Error: ', '')}
+            </p>
+          ) : isUser ? (
+            <p className="whitespace-pre-wrap text-sm leading-relaxed">
+              {message.content}
+            </p>
+          ) : (
+            <div className="p-5">
+              <AnalysisFormatter content={message.content} />
+            </div>
+          )}
         </Card>
 
         {/* Calculations */}

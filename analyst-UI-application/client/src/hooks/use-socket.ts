@@ -11,8 +11,12 @@ export function useSocket() {
 
   useEffect(() => {
     // Initialize socket
+    // Allow Socket.IO to negotiate transport (polling first, then upgrade to websocket)
     socketRef.current = io(SOCKET_URL, {
-      transports: ['websocket'],
+      transports: ['polling', 'websocket'],
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
     });
 
     const socket = socketRef.current;

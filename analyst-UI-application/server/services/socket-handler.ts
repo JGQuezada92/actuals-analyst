@@ -22,20 +22,25 @@ export function setupSocketHandlers(
     socket.on('chat:message', async (data: { message: string; options?: any }) => {
       const messageId = uuidv4();
       
+      console.log(`[Socket] Received chat message: "${data.message.substring(0, 50)}..." (ID: ${messageId})`);
+      
       try {
         socket.emit('chat:message:received', { id: messageId });
         socket.emit('chat:typing', { isTyping: true });
 
         const onProgress = (response: AgentResponse) => {
+          console.log(`[Socket] Progress update: ${response.data?.message || 'Unknown phase'}`);
           socket.emit('chat:progress', { messageId, ...response });
         };
 
+        console.log(`[Socket] Calling agentBridge.analyzeQuery...`);
         const result = await agentBridge.analyzeQuery(
           data.message,
           data.options || {},
           onProgress
         );
 
+        console.log(`[Socket] Agent completed successfully`);
         socket.emit('chat:typing', { isTyping: false });
 
         const response: ChatMessage = {
@@ -54,10 +59,14 @@ export function setupSocketHandlers(
         socket.emit('chat:message:response', response);
 
       } catch (error: any) {
+        console.error(`[Socket] Error processing chat message:`, error);
+        console.error(`[Socket] Error stack:`, error.stack);
+        console.error(`[Socket] Error message:`, error.message);
+        
         socket.emit('chat:typing', { isTyping: false });
         socket.emit('chat:error', {
           messageId,
-          error: error.message,
+          error: error.message || 'An unknown error occurred',
           timestamp: new Date().toISOString(),
         });
       }

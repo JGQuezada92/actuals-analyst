@@ -50,6 +50,9 @@ export class AgentBridge extends EventEmitter {
       const isWindows = process.platform === 'win32';
       let proc: ChildProcess;
       
+      // Set environment variable to request JSON output
+      const env = { ...process.env, JSON_OUTPUT: 'true' };
+      
       if (isWindows && this.pythonPath.includes(' ')) {
         // For Windows with "py -3.13", use the Python launcher directly
         // Split the Python command and pass arguments as array to spawn
@@ -63,7 +66,7 @@ export class AgentBridge extends EventEmitter {
         console.log(`🐍 Running (Windows): ${pythonExec} ${spawnArgs.join(' ')}`);
         proc = spawn(pythonExec, spawnArgs, {
           cwd: this.agentDir,
-          env: { ...process.env },
+          env: env,
           shell: false, // Don't use shell - spawn handles paths with spaces automatically
         });
       } else {
@@ -75,7 +78,7 @@ export class AgentBridge extends EventEmitter {
         console.log(`🐍 Running: ${pythonExec} ${allArgs.join(' ')}`);
         proc = spawn(pythonExec, allArgs, {
           cwd: this.agentDir,
-          env: { ...process.env },
+          env: env,
           shell: isWindows,
         });
       }
@@ -84,36 +87,64 @@ export class AgentBridge extends EventEmitter {
       let stdout = '';
       let stderr = '';
 
+      console.log(`[Agent] Starting Python process for query: "${query.substring(0, 50)}..."`);
+
       proc.stdout.on('data', (data: Buffer) => {
         const chunk = data.toString();
         stdout += chunk;
+        // Log first few lines of stdout for debugging
+        const lines = chunk.split('\n').filter(l => l.trim());
+        if (lines.length > 0) {
+          console.log(`[Agent stdout] ${lines[0].substring(0, 200)}`);
+        }
         this.parseStreamingOutput(chunk, requestId, onProgress);
       });
 
       proc.stderr.on('data', (data: Buffer) => {
         const chunk = data.toString();
         stderr += chunk;
+        console.log(`[Agent stderr] ${chunk.trim()}`);
         this.parseProgressOutput(chunk, requestId, onProgress);
       });
 
       proc.on('close', (code) => {
         this.activeProcess = null;
 
+        console.log(`[Agent] Process exited with code ${code}`);
+        
         if (code === 0) {
           try {
             const result = this.extractFinalResult(stdout);
+            console.log(`[Agent] Successfully parsed result`);
             resolve(result);
           } catch (e) {
+            console.warn(`[Agent] Failed to parse JSON result, returning raw output:`, e);
             resolve({ analysis: stdout, raw: true });
           }
         } else {
-          reject(new Error(`Agent exited with code ${code}: ${stderr.slice(-500)}`));
+          const errorMessage = `Agent exited with code ${code}`;
+          const errorDetails = stderr.slice(-1000); // Last 1000 chars of stderr
+          console.error(`[Agent Error] ${errorMessage}`);
+          console.error(`[Agent Error Details] ${errorDetails}`);
+          
+          // Try to extract meaningful error from stderr
+          const errorLines = stderr.split('\n').filter(line => 
+            line.includes('Error') || 
+            line.includes('Exception') || 
+            line.includes('Traceback') ||
+            line.includes('File') ||
+            line.trim().length > 0
+          );
+          
+          const meaningfulError = errorLines.slice(-10).join('\n') || errorDetails;
+          reject(new Error(`${errorMessage}\n\n${meaningfulError}`));
         }
       });
 
       proc.on('error', (error) => {
         this.activeProcess = null;
-        reject(error);
+        console.error(`[Agent Process Error]`, error);
+        reject(new Error(`Failed to start Python process: ${error.message}`));
       });
     });
   }

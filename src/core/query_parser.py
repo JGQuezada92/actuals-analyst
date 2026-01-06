@@ -484,12 +484,25 @@ class QueryParser:
         transaction_types = []
         subsidiaries = []
         
+        # Track specific prefixes to exclude general parent prefixes
+        # e.g., if "53" (S&M) is specified, exclude "5" (all expenses)
+        specific_prefixes = set()
+        general_prefixes_to_exclude = {
+            "53": ["5"],  # S&M (53) excludes general expenses (5)
+            "52": ["5"],  # R&D (52) excludes general expenses (5)
+            "59": ["5"],  # G&A (59) excludes general expenses (5)
+            "51": ["5"],  # COGS (51) excludes general expenses (5)
+        }
+        
         for term in resolved_terms:
             if term.category == SemanticCategory.ACCOUNT:
                 # Merge account prefixes
                 for prefix in term.filter_values:
                     if prefix not in account_prefixes:
                         account_prefixes.append(prefix)
+                    # Track specific prefixes (53, 52, 59, 51) to exclude parent "5"
+                    if prefix in ["53", "52", "59", "51"]:
+                        specific_prefixes.add(prefix)
                 logger.debug(f"Semantic: '{term.term}' -> account filter {term.filter_values}")
             
             elif term.category == SemanticCategory.COMPOUND_ACCOUNT:
@@ -498,6 +511,9 @@ class QueryParser:
                 for prefix in term.filter_values:
                     if prefix not in account_prefixes:
                         account_prefixes.append(prefix)
+                    # Track specific prefixes (53, 52, 59, 51) to exclude parent "5"
+                    if prefix in ["53", "52", "59", "51"]:
+                        specific_prefixes.add(prefix)
                 # Secondary filter: account name contains
                 if term.secondary_filter_values:
                     for name_val in term.secondary_filter_values:
@@ -536,7 +552,24 @@ class QueryParser:
                         subsidiaries.append(sub)
                 logger.debug(f"Semantic: '{term.term}' -> subsidiary filter {term.filter_values}")
         
-        # Build filter objects
+        # Remove general parent prefixes if specific child prefixes are present
+        # e.g., if "53" is in the list, remove "5" (since 53xxx is a subset of 5xxx)
+        # This must happen BEFORE building the filter objects so the filter builder gets the cleaned list
+        prefixes_to_remove = set()
+        for specific_prefix in specific_prefixes:
+            if specific_prefix in general_prefixes_to_exclude:
+                for general_prefix in general_prefixes_to_exclude[specific_prefix]:
+                    if general_prefix in account_prefixes:
+                        prefixes_to_remove.add(general_prefix)
+                        logger.debug(
+                            f"Removing general prefix '{general_prefix}' because specific prefix "
+                            f"'{specific_prefix}' is present"
+                        )
+        
+        # Remove the general prefixes
+        account_prefixes = [p for p in account_prefixes if p not in prefixes_to_remove]
+        
+        # Build filter objects (using cleaned account_prefixes list)
         if account_prefixes:
             result["account_type_filter"] = {
                 "filter_type": "prefix",

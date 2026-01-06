@@ -444,7 +444,15 @@ class FinancialCalculator:
         else:
             fy_start = date_type(as_of_date.year - 1, fiscal_start_month, 1)
         
-        fiscal_year = fy_start.year
+        # Calculate fiscal year (named after ENDING calendar year, not starting year)
+        # For Feb-start: FY2026 = Feb 2025 - Jan 2026
+        # If as_of_date is Jan 2026, fiscal_year should be 2026 (not 2025)
+        if as_of_date.month >= fiscal_start_month:
+            # We're in months Feb-Dec, so FY ends next calendar year
+            fiscal_year = as_of_date.year + 1
+        else:
+            # We're in Jan (or before FY start), FY ends this calendar year
+            fiscal_year = as_of_date.year
         
         # Parse and filter data
         ytd_total = 0.0

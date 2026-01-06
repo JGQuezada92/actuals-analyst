@@ -412,13 +412,57 @@ class NetSuiteRESTClient:
             response = requests.get(full_url, headers=headers, timeout=120)
             
             if response.status_code != 200:
-                logger.error(f"RESTlet error: {response.status_code} - {response.text[:500]}")
-                raise DataRetrievalError(f"RESTlet returned {response.status_code}")
+                error_text = response.text[:1000] if response.text else "No response body"
+                logger.error(
+                    f"RESTlet HTTP error {response.status_code} for search {search_id} (page {current_page}):\n"
+                    f"URL: {full_url[:200]}...\n"
+                    f"Response: {error_text}"
+                )
+                raise DataRetrievalError(
+                    f"RESTlet returned {response.status_code}: {error_text[:200]}"
+                )
             
-            result = response.json()
+            try:
+                result = response.json()
+            except Exception as e:
+                error_text = response.text[:1000] if response.text else "No response body"
+                logger.error(
+                    f"Failed to parse RESTlet JSON response for search {search_id} (page {current_page}):\n"
+                    f"URL: {full_url[:200]}...\n"
+                    f"Response text: {error_text}\n"
+                    f"Parse error: {e}"
+                )
+                raise DataRetrievalError(
+                    f"RESTlet returned invalid JSON: {error_text[:200]}"
+                )
             
             if not result.get("success"):
-                raise DataRetrievalError(f"RESTlet error: {result.get('error')}")
+                error_msg = result.get('error', 'Unknown error')
+                error_details = result.get('errorDetails', {})
+                error_stack = result.get('errorStack', '')
+                
+                # Log comprehensive error details
+                logger.error(
+                    f"RESTlet error for search {search_id} (page {current_page}):\n"
+                    f"Error: {error_msg}\n"
+                    f"Error Details: {error_details}\n"
+                    f"Error Stack: {error_stack[:500] if error_stack else 'N/A'}\n"
+                    f"Filters Applied: {filter_params}\n"
+                    f"Full Response: {json.dumps(result, indent=2)[:1000]}"
+                )
+                
+                # Build detailed error message
+                detailed_error = f"RESTlet error: {error_msg}"
+                if error_details:
+                    detailed_error += f"\nDetails: {json.dumps(error_details)}"
+                if error_stack:
+                    detailed_error += f"\nStack trace: {error_stack[:500]}"
+                
+                raise DataRetrievalError(detailed_error)
+            
+            # Process RESTlet v2.2+ metadata (version, filterWarnings)
+            if current_page == 0:
+                self._process_restlet_response_metadata(result, search_id, current_page)
             
             if current_page == 0:
                 columns = result.get("columns", [])
@@ -489,12 +533,56 @@ class NetSuiteRESTClient:
         response = requests.get(full_url, headers=headers, timeout=120)
         
         if response.status_code != 200:
-            raise DataRetrievalError(f"RESTlet returned {response.status_code}")
+            error_text = response.text[:1000] if response.text else "No response body"
+            logger.error(
+                f"RESTlet HTTP error {response.status_code} for search {search_id}:\n"
+                f"URL: {full_url[:200]}...\n"
+                f"Response: {error_text}"
+            )
+            raise DataRetrievalError(
+                f"RESTlet returned {response.status_code}: {error_text[:200]}"
+            )
         
-        first_result = response.json()
+        try:
+            first_result = response.json()
+        except Exception as e:
+            error_text = response.text[:1000] if response.text else "No response body"
+            logger.error(
+                f"Failed to parse RESTlet JSON response for search {search_id}:\n"
+                f"URL: {full_url[:200]}...\n"
+                f"Response text: {error_text}\n"
+                f"Parse error: {e}"
+            )
+            raise DataRetrievalError(
+                f"RESTlet returned invalid JSON: {error_text[:200]}"
+            )
         
         if not first_result.get("success"):
-            raise DataRetrievalError(f"RESTlet error: {first_result.get('error')}")
+            error_msg = first_result.get('error', 'Unknown error')
+            error_details = first_result.get('errorDetails', {})
+            error_stack = first_result.get('errorStack', '')
+            
+            # Log comprehensive error details
+            logger.error(
+                f"RESTlet error for search {search_id}:\n"
+                f"Error: {error_msg}\n"
+                f"Error Details: {error_details}\n"
+                f"Error Stack: {error_stack[:500] if error_stack else 'N/A'}\n"
+                f"Filters Applied: {filter_params}\n"
+                f"Full Response: {json.dumps(first_result, indent=2)[:1000]}"
+            )
+            
+            # Build detailed error message
+            detailed_error = f"RESTlet error: {error_msg}"
+            if error_details:
+                detailed_error += f"\nDetails: {json.dumps(error_details)}"
+            if error_stack:
+                detailed_error += f"\nStack trace: {error_stack[:500]}"
+            
+            raise DataRetrievalError(detailed_error)
+        
+        # Process RESTlet v2.2+ metadata (version, filterWarnings)
+        self._process_restlet_response_metadata(first_result, search_id, page=0)
         
         columns = first_result.get("columns", [])
         total_pages = first_result.get("totalPages", 1)
@@ -550,6 +638,76 @@ class NetSuiteRESTClient:
             column_names=column_names,
             execution_time_ms=execution_time,
         )
+    
+    def _process_restlet_response_metadata(self, result: Dict[str, Any], search_id: str, page: int = 0):
+        """
+        Process RESTlet v2.2+ response metadata: version checking and filter warnings.
+        
+        This method handles:
+        - RESTlet version logging (v2.2+ includes version field)
+        - filterWarnings processing (new in v2.2 for periods not found, etc.)
+        - filterErrors processing (existing error handling)
+        
+        Args:
+            result: Parsed JSON response from RESTlet
+            search_id: Search ID for logging context
+            page: Page number (0 for first page, used in logging)
+        """
+        # Log RESTlet version (helps debugging and confirms v2.2+)
+        restlet_version = result.get("version", "unknown")
+        if restlet_version != "unknown":
+            if page == 0:  # Only log version on first page to avoid spam
+                logger.info(f"RESTlet version: {restlet_version}")
+            
+            # Warn if version is below 2.2 (period ID conversion may not work)
+            try:
+                version_parts = restlet_version.split(".")
+                major = int(version_parts[0]) if len(version_parts) > 0 else 0
+                minor = int(version_parts[1]) if len(version_parts) > 1 else 0
+                
+                if major < 2 or (major == 2 and minor < 2):
+                    logger.warning(
+                        f"RESTlet version {restlet_version} is below 2.2. "
+                        f"Period ID conversion may not work correctly. "
+                        f"Please update to RESTlet v2.2+ for proper period filtering."
+                    )
+            except (ValueError, IndexError):
+                # Version string doesn't match expected format, log as debug
+                logger.debug(f"RESTlet version format unexpected: {restlet_version}")
+        
+        # Handle filter warnings (new in v2.2)
+        # These are non-fatal warnings about filter issues (e.g., periods not found)
+        filter_warnings = result.get("filterWarnings", [])
+        if filter_warnings:
+            for warning in filter_warnings:
+                warning_type = warning.get("type", "unknown")
+                
+                if warning_type == "periodNames":
+                    # Period names that couldn't be found in NetSuite
+                    not_found = warning.get("notFound", [])
+                    if not_found:
+                        logger.warning(
+                            f"RESTlet: {len(not_found)} period(s) not found in NetSuite: "
+                            f"{', '.join(not_found[:5])}"
+                            f"{'...' if len(not_found) > 5 else ''}. "
+                            f"RESTlet will fall back to date range filtering."
+                        )
+                elif warning_type == "dateRange":
+                    # Date range filter issue
+                    warning_msg = warning.get("message", "Date range filter warning")
+                    logger.warning(f"RESTlet date range filter warning: {warning_msg}")
+                else:
+                    # Generic warning
+                    warning_msg = warning.get("message", str(warning))
+                    logger.warning(f"RESTlet filter warning ({warning_type}): {warning_msg}")
+        
+        # Handle filter errors (existing error handling - these are more severe)
+        filter_errors = result.get("filterErrors", [])
+        if filter_errors:
+            for error in filter_errors:
+                error_type = error.get("type", "unknown")
+                error_msg = error.get("message", str(error))
+                logger.error(f"RESTlet filter error ({error_type}): {error_msg}")
     
     def _update_registry_from_data(self, data: List[Dict]):
         """Update dynamic registry from fetched data."""
