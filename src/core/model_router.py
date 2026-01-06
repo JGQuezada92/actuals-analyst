@@ -15,6 +15,8 @@ from typing import Optional, List, Dict, Any, Union
 from enum import Enum
 
 from config.settings import ModelConfig, ModelProvider, get_config
+from src.core.observability import get_tracer, SpanKind
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -432,23 +434,51 @@ class ModelRouter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> LLMResponse:
-        """Route generation request to the active model with error handling."""
+        """Route generation request to the active model with observability tracking."""
+        tracer = get_tracer()
+        start_time = time.time()
+        
         logger.info(f"Routing request to {self.config.provider.value}:{self.config.model_name}")
         
-        try:
-            return self._client.generate(messages, temperature, max_tokens)
-        except LLMQuotaExhaustedError as e:
-            logger.error(f"LLM quota exhausted: {e}")
-            raise
-        except LLMContentBlockedError as e:
-            logger.warning(f"LLM content blocked: {e}")
-            raise
-        except LLMAPIError as e:
-            logger.error(f"LLM API error: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error in model router: {e}")
-            raise LLMAPIError(f"Unexpected error: {e}") from e
+        with tracer.start_span(f"llm_generate_{self.config.model_name}", SpanKind.LLM_CALL) as span:
+            try:
+                response = self._client.generate(messages, temperature, max_tokens)
+                
+                latency_ms = (time.time() - start_time) * 1000
+                
+                if span:
+                    tracer.record_llm_usage(
+                        span=span,
+                        model=self.config.model_name,
+                        provider=self.config.provider.value,
+                        input_tokens=response.usage.get("input_tokens", 0),
+                        output_tokens=response.usage.get("output_tokens", 0),
+                        latency_ms=latency_ms,
+                    )
+                    span.attributes["temperature"] = temperature or self.config.temperature
+                    span.attributes["max_tokens"] = max_tokens or self.config.max_tokens
+                
+                return response
+            except LLMQuotaExhaustedError as e:
+                if span:
+                    span.set_error(e)
+                logger.error(f"LLM quota exhausted: {e}")
+                raise
+            except LLMContentBlockedError as e:
+                if span:
+                    span.set_error(e)
+                logger.warning(f"LLM content blocked: {e}")
+                raise
+            except LLMAPIError as e:
+                if span:
+                    span.set_error(e)
+                logger.error(f"LLM API error: {e}")
+                raise
+            except Exception as e:
+                if span:
+                    span.set_error(e)
+                logger.error(f"Unexpected error in model router: {e}")
+                raise LLMAPIError(f"Unexpected error: {e}") from e
     
     def generate_with_system(
         self,

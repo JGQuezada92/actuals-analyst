@@ -29,6 +29,10 @@ logs/
 .outputs/
 *.cache
 
+# Observability
+traces/
+regression_results/
+
 # Test
 .pytest_cache/
 .coverage

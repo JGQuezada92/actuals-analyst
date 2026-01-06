@@ -28,6 +28,8 @@ from src.core.memory import Session, SessionManager, get_session_manager
 from src.core.data_context import DataContext, get_data_context
 from src.core.financial_semantics import apply_disambiguation_choice, get_semantic_term
 from src.core.query_cost_estimator import QueryCostEstimator, QueryCostEstimate, get_query_cost_estimator
+from src.core.observability import get_tracer, SpanKind
+from src.core.prompt_manager import get_prompt_manager
 from src.tools.netsuite_client import NetSuiteDataRetriever, SavedSearchResult, get_data_retriever
 from src.tools.calculator import FinancialCalculator, CalculationResult, get_calculator, MetricType
 from src.tools.charts import ChartGenerator, ChartOutput, get_chart_generator
@@ -126,55 +128,7 @@ class AgentResponse:
 
 class FinancialAnalystAgent:
     """
-    The main Financial Analyst Agent.
-    
-    Orchestrates data retrieval, calculations, analysis generation,
-    and evaluation in a rigorous, accuracy-first workflow.
-    """
-    
-    SYSTEM_PROMPT = """You are a senior financial analyst with expertise in interpreting 
-NetSuite financial data. You provide accurate, insightful analysis based strictly on 
-the data provided.
-
-## Core Principles
-1. **Data-Grounded**: Every claim must reference specific data points
-2. **Calculated Precision**: Use the provided calculation results - do not recalculate
-3. **Actionable Insights**: Provide clear, specific recommendations
-4. **Professional Tone**: Write for a CFO-level audience
-
-## Analysis Structure
-1. Executive Summary (2-3 sentences)
-2. Key Findings (with specific numbers)
-3. Trend Analysis (if applicable)
-4. Recommendations (specific, actionable)
-
-## Formatting for Slack
-- Use *bold* for emphasis (Slack format)
-- Use bullet points for lists
-- Keep paragraphs concise
-- Include specific dollar amounts and percentages
-"""
-
-    ANALYSIS_PROMPT = """Analyze the following financial data and provide a professional analysis.
-
-## User Query
-{query}
-
-## Data Summary
-- Total rows: {row_count}
-- Date range: {date_range}
-- Columns available: {columns}
-
-## Pre-Calculated Metrics
-{calculations}
-
-## Sample Data (first 10 rows)
-{sample_data}
-
-## Data by Category (if applicable)
-{category_breakdown}
-
-{statistical_context}
+    def __init__(
 
 Provide a comprehensive analysis following the structure in your instructions.
 Remember: Use the pre-calculated metrics exactly as provided - do not recalculate.
@@ -219,6 +173,7 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         self.statistical_analyzer = statistical_analyzer or get_statistical_analyzer(
             fiscal_start_month=self.fiscal_calendar.fy_start_month
         )
+        self.prompt_manager = get_prompt_manager()
         self.config = get_config()
     
     async def analyze(
@@ -230,9 +185,11 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         session: Optional[Session] = None,
         session_id: Optional[str] = None,
         disambiguation_choice: Optional[Dict[str, int]] = None,
+        user_id: Optional[str] = None,
+        channel: Optional[str] = None,
     ) -> AgentResponse:
         """
-        Main analysis entry point.
+        Main analysis entry point with observability.
         
         Args:
             query: User's analysis question
@@ -243,73 +200,104 @@ as "associated with" not "causes" unless there's clear causal reasoning.
             session_id: Session ID to retrieve existing session
             disambiguation_choice: Dict mapping ambiguous terms to user's choice index.
                                   Example: {"sales": 0} means user chose option 0 (revenue)
+            user_id: User identifier for tracing
+            channel: Channel identifier (slack, cli, api) for tracing
         
         Returns:
             Complete AgentResponse with analysis, charts, and evaluation.
             If disambiguation is required, returns early with clarification request.
         """
-        logger.info(f"Starting analysis for query: {query[:100]}...")
+        tracer = get_tracer()
         
-        # Get or create session for conversation memory
-        if session is None and session_id:
-            session = self.session_manager.get_session(session_id)
-        if session is None:
-            session = self.session_manager.create_session()
-        
-        # Phase 0: Parse Query
-        parsed_query = self._parse_query(query, session)
-        logger.info(f"Parsed intent: {parsed_query.intent.value}, confidence: {parsed_query.confidence:.2f}")
-        
-        # Check for disambiguation requirement (NEW)
-        if parsed_query.requires_disambiguation:
-            if disambiguation_choice:
-                # User has provided their choice, apply it
-                parsed_query = self._apply_disambiguation(parsed_query, disambiguation_choice)
-                logger.info(f"Applied disambiguation choice: {disambiguation_choice}")
-            else:
-                # Return early asking for clarification
-                logger.info(f"Disambiguation required for: {parsed_query.ambiguous_terms}")
-                return self._build_disambiguation_response(query, parsed_query, session)
-        
-        # Estimate query cost and warn if expensive (Phase 2.4)
-        cost_estimate = self.cost_estimator.estimate(parsed_query)
-        if cost_estimate.should_warn_user:
-            logger.warning(
-                f"Expensive query detected: {cost_estimate.estimated_rows:,} rows, "
-                f"~{cost_estimate.estimated_time_seconds}s, complexity={cost_estimate.complexity}"
-            )
-            # Could return a warning response here if desired
-            # For now, just log and proceed
-        
-        # Phase 1: Data Retrieval (always uses RESTlet for accuracy)
-        context = await self._retrieve_data(query, search_id, parsed_query)
-        context.parsed_query = parsed_query
-        context.session = session
-        
-        # Phase 1.5: Filter Data based on parsed query (now happens at DB level too)
-        context = self._filter_data(context)
-        
-        # Phase 2: Deterministic Calculations (now with fiscal awareness)
-        context = self._perform_calculations(context)
-        
-        # Phase 2.5: Statistical Analysis (if requested)
-        if parsed_query.intent in [QueryIntent.CORRELATION, QueryIntent.REGRESSION, QueryIntent.VOLATILITY]:
-            context = self._run_statistical_analysis(context)
-        
-        # Phase 3: Chart Generation
-        if include_charts:
-            context = self._generate_charts(context)
-        
-        # Phase 4: Analysis Generation with Reflection
-        context = self._generate_analysis(context, max_iterations)
-        
-        # Phase 5: Final Evaluation
-        context = self._evaluate_analysis(context)
-        
-        # Update session with this conversation
-        self._update_session(context)
-        
-        return self._build_response(context)
+        with tracer.start_trace(query, user_id=user_id, session_id=session_id, channel=channel) as trace:
+            logger.info(f"Starting analysis for query: {query[:100]}...")
+            
+            # Get or create session for conversation memory
+            if session is None and session_id:
+                session = self.session_manager.get_session(session_id)
+            if session is None:
+                session = self.session_manager.create_session()
+            
+            # Phase 0: Parse Query
+            with tracer.start_span("phase_0_query_parsing", SpanKind.PIPELINE_PHASE) as span:
+                parsed_query = self._parse_query(query, session)
+                logger.info(f"Parsed intent: {parsed_query.intent.value}, confidence: {parsed_query.confidence:.2f}")
+                if span:
+                    span.attributes["parsed_intent"] = parsed_query.intent.value
+                    span.attributes["confidence"] = parsed_query.confidence
+            
+            # Check for disambiguation requirement (NEW)
+            if parsed_query.requires_disambiguation:
+                if disambiguation_choice:
+                    # User has provided their choice, apply it
+                    parsed_query = self._apply_disambiguation(parsed_query, disambiguation_choice)
+                    logger.info(f"Applied disambiguation choice: {disambiguation_choice}")
+                else:
+                    # Return early asking for clarification
+                    logger.info(f"Disambiguation required for: {parsed_query.ambiguous_terms}")
+                    return self._build_disambiguation_response(query, parsed_query, session)
+            
+            # Estimate query cost and warn if expensive (Phase 2.4)
+            cost_estimate = self.cost_estimator.estimate(parsed_query)
+            if cost_estimate.should_warn_user:
+                logger.warning(
+                    f"Expensive query detected: {cost_estimate.estimated_rows:,} rows, "
+                    f"~{cost_estimate.estimated_time_seconds}s, complexity={cost_estimate.complexity}"
+                )
+            
+            # Phase 1: Data Retrieval (always uses RESTlet for accuracy)
+            with tracer.start_span("phase_1_data_retrieval", SpanKind.DATA_RETRIEVAL) as span:
+                context = await self._retrieve_data(query, search_id, parsed_query)
+                context.parsed_query = parsed_query
+                context.session = session
+                if span:
+                    span.attributes["rows_retrieved"] = context.raw_data.row_count
+            
+            # Phase 1.5: Filter Data based on parsed query (now happens at DB level too)
+            with tracer.start_span("phase_1.5_data_filtering", SpanKind.DATA_RETRIEVAL) as span:
+                context = self._filter_data(context)
+                if span:
+                    span.attributes["rows_filtered"] = len(context.working_data)
+            
+            # Phase 2: Deterministic Calculations (now with fiscal awareness)
+            with tracer.start_span("phase_2_calculations", SpanKind.CALCULATION) as span:
+                context = self._perform_calculations(context)
+                if span:
+                    span.attributes["calculation_count"] = len(context.calculations)
+                
+                # Phase 2.5: Statistical Analysis (if requested)
+                if parsed_query.intent in [QueryIntent.CORRELATION, QueryIntent.REGRESSION, QueryIntent.VOLATILITY]:
+                    with tracer.start_span("phase_2.5_statistical_analysis", SpanKind.CALCULATION) as span:
+                        context = self._run_statistical_analysis(context)
+            
+            # Phase 3: Chart Generation
+            if include_charts:
+                with tracer.start_span("phase_3_chart_generation", SpanKind.TOOL_CALL) as span:
+                    context = self._generate_charts(context)
+                    if span:
+                        span.attributes["chart_count"] = len(context.charts)
+            
+            # Phase 4: Analysis Generation with Reflection
+            with tracer.start_span("phase_4_analysis_generation", SpanKind.LLM_CALL) as span:
+                context = self._generate_analysis(context, max_iterations)
+                if span:
+                    span.attributes["iteration_count"] = context.iteration_count
+            
+            # Phase 5: Final Evaluation
+            with tracer.start_span("phase_5_evaluation", SpanKind.EVALUATION) as span:
+                context = self._evaluate_analysis(context)
+                if span and context.evaluation:
+                    span.attributes["evaluation_score"] = context.evaluation.average_qualitative_score
+                    span.attributes["passed_threshold"] = context.evaluation.passes_threshold
+                    tracer.record_evaluation(
+                        score=context.evaluation.average_qualitative_score,
+                        passed=context.evaluation.passes_threshold
+                    )
+            
+            # Update session with this conversation
+            self._update_session(context)
+            
+            return self._build_response(context)
     
     def _apply_disambiguation(
         self,
@@ -860,23 +848,71 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         if statistical_context:
             statistical_context = f"\n## Statistical Analysis Results\n{statistical_context}\n"
         
-        prompt = self.ANALYSIS_PROMPT.format(
+        # Use prompt manager for versioned prompts
+        try:
+            analysis_prompt = self.prompt_manager.get_prompt("financial_analysis")
+            user_prompt = analysis_prompt.format(
             query=query_context,
-            row_count=len(context.working_data),
-            date_range=date_range,
-            columns=", ".join(context.raw_data.column_names),
+                data_summary=f"- Total rows: {len(context.working_data)}\n- Date range: {date_range}\n- Columns available: {', '.join(context.raw_data.column_names)}",
             calculations=calc_summary or "No calculations available",
-            sample_data=sample_data,
-            category_breakdown=category_breakdown or "No category breakdown available",
-            statistical_context=statistical_context,
-        )
-        
-        # Add data context, conversation context, and parsed info to prompt
-        prompt = data_context_info + "\n" + conversation_context + parsed_info + prompt
+                time_context=date_range,
+                filter_summary=f"Filtered data: {len(context.working_data)} rows",
+                conversation_context=conversation_context + parsed_info + data_context_info,
+                statistical_context=statistical_context,
+            )
+            system_prompt = analysis_prompt.system_prompt
+        except FileNotFoundError:
+            # Fallback to inline prompts if prompt manager fails
+            logger.warning("Prompt manager failed, using inline prompts")
+            user_prompt = f"""Analyze the following financial data and provide a professional analysis.
+
+## User Query
+{query_context}
+
+## Data Summary
+- Total rows: {len(context.working_data)}
+- Date range: {date_range}
+- Columns available: {', '.join(context.raw_data.column_names)}
+
+## Pre-Calculated Metrics
+{calc_summary or "No calculations available"}
+
+## Sample Data (first 10 rows)
+{sample_data}
+
+## Data by Category (if applicable)
+{category_breakdown or "No category breakdown available"}
+
+{statistical_context}
+
+{data_context_info}
+{conversation_context}
+{parsed_info}"""
+            system_prompt = """You are a senior financial analyst with expertise in interpreting 
+NetSuite financial data. You provide accurate, insightful analysis based strictly on 
+the data provided.
+
+## Core Principles
+1. **Data-Grounded**: Every claim must reference specific data points
+2. **Calculated Precision**: Use the provided calculation results - do not recalculate
+3. **Actionable Insights**: Provide clear, specific recommendations
+4. **Professional Tone**: Write for a CFO-level audience
+
+## Analysis Structure
+1. Executive Summary (2-3 sentences)
+2. Key Findings (with specific numbers)
+3. Trend Analysis (if applicable)
+4. Recommendations (specific, actionable)
+
+## Formatting for Slack
+- Use *bold* for emphasis (Slack format)
+- Use bullet points for lists
+- Keep paragraphs concise
+- Include specific dollar amounts and percentages"""
         
         response = self.router.generate_with_system(
-            system_prompt=self.SYSTEM_PROMPT,
-            user_message=prompt,
+            system_prompt=system_prompt,
+            user_message=user_prompt,
         )
         
         analysis = response.content

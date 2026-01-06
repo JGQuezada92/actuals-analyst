@@ -1,0 +1,85 @@
+{
+  "version": "1.0",
+  "name": "Core Financial Queries",
+  "description": "Baseline test cases for common financial analysis queries",
+  "created_at": "2025-01-05T00:00:00Z",
+  "data_source": "NetSuite Saved Search",
+  "fiscal_year": "FY2025",
+  "notes": "Initial golden dataset - values to be populated from verified production runs",
+  "test_cases": [
+    {
+      "test_id": "TC001",
+      "name": "Total Expenses YTD",
+      "description": "Basic expense total for year-to-date",
+      "query": "What are our total expenses YTD?",
+      "expected_intent": "total",
+      "expected_departments": [],
+      "expected_account_prefix": ["5", "6", "7", "8"],
+      "expected_calculations": [
+        {
+          "metric_name": "Total Amount",
+          "expected_value": 0,
+          "tolerance_percent": 1.0
+        }
+      ],
+      "analysis_must_contain": ["expense", "total"],
+      "analysis_must_not_contain": ["revenue"],
+      "min_evaluation_score": 7.0,
+      "notes": "TODO: Populate expected_value from verified production run"
+    },
+    {
+      "test_id": "TC002",
+      "name": "G&A Department Expenses",
+      "description": "Expenses filtered to G&A department",
+      "query": "Show me G&A expenses for this fiscal year",
+      "expected_intent": "summary",
+      "expected_departments": ["G&A"],
+      "expected_account_prefix": ["5", "6", "7", "8"],
+      "expected_calculations": [],
+      "analysis_must_contain": ["G&A"],
+      "analysis_must_not_contain": [],
+      "min_evaluation_score": 7.0
+    },
+    {
+      "test_id": "TC003",
+      "name": "Revenue Total",
+      "description": "Total revenue - tests semantic mapping to account prefix 4",
+      "query": "What is our total revenue YTD?",
+      "expected_intent": "total",
+      "expected_departments": [],
+      "expected_account_prefix": ["4"],
+      "expected_calculations": [],
+      "analysis_must_contain": ["revenue"],
+      "analysis_must_not_contain": ["expense", "cost"],
+      "min_evaluation_score": 7.0,
+      "notes": "Critical test - validates revenue maps to accounts, not Sales department"
+    },
+    {
+      "test_id": "TC004",
+      "name": "Sales & Marketing Costs by Department",
+      "description": "Tests compound filter - account name contains + expense accounts",
+      "query": "What are our Sales & Marketing costs for the SDR department YTD?",
+      "expected_intent": "total",
+      "expected_departments": ["SDR"],
+      "expected_account_prefix": ["5"],
+      "expected_account_name_contains": ["Sales & Marketing"],
+      "expected_calculations": [],
+      "analysis_must_contain": ["SDR", "Sales", "Marketing"],
+      "analysis_must_not_contain": [],
+      "min_evaluation_score": 7.0
+    },
+    {
+      "test_id": "TC005",
+      "name": "Trend Analysis",
+      "description": "Tests trend detection and time series analysis",
+      "query": "Show me the expense trend over the past 6 months",
+      "expected_intent": "trend",
+      "expected_departments": [],
+      "expected_calculations": [],
+      "analysis_must_contain": ["trend"],
+      "analysis_must_not_contain": [],
+      "min_evaluation_score": 7.0
+    }
+  ]
+}
+

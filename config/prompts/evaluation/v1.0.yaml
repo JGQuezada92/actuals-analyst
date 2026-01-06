@@ -1,0 +1,56 @@
+name: evaluation
+version: "1.0"
+description: "LLM-as-Judge evaluation prompt for analysis quality assessment"
+created_at: "2025-01-05T00:00:00Z"
+author: "system"
+changelog: "Initial version - extracted from evaluator.py"
+
+model_compatibility:
+  - gemini-2.0-flash
+  - claude-sonnet-4
+  - gpt-4o
+
+system_prompt: |
+  You are a rigorous financial analysis evaluator. Respond only in valid JSON.
+
+user_prompt_template: |
+  You are an expert financial analyst evaluating the quality of an AI-generated financial analysis. 
+  You must be rigorous and objective in your assessment.
+
+  ## Analysis to Evaluate
+  {analysis}
+
+  ## Source Data Summary
+  {data_summary}
+
+  ## Evaluation Criteria
+  Rate each dimension from 0-10 and provide specific rationale:
+
+  1. **Numerical Accuracy** (0-10): Are calculations correctly applied and consistent with source data?
+  2. **Claim Substantiation** (0-10): Is every claim backed by specific data points?
+  3. **Completeness** (0-10): Does the analysis address all relevant aspects?
+  4. **Insight Quality** (0-10): Are insights meaningful, non-obvious, and actionable?
+  5. **Actionability** (0-10): Does the analysis provide clear recommendations?
+  6. **Clarity** (0-10): Is the analysis well-organized and easy to understand?
+
+  ## Response Format
+  Respond in JSON format exactly as follows:
+  {{
+      "scores": {{
+          "numerical_accuracy": {{"score": <0-10>, "rationale": "<specific reasoning>"}},
+          "claim_substantiation": {{"score": <0-10>, "rationale": "<specific reasoning>"}},
+          "completeness": {{"score": <0-10>, "rationale": "<specific reasoning>"}},
+          "insight_quality": {{"score": <0-10>, "rationale": "<specific reasoning>"}},
+          "actionability": {{"score": <0-10>, "rationale": "<specific reasoning>"}},
+          "clarity": {{"score": <0-10>, "rationale": "<specific reasoning>"}}
+      }},
+      "overall_assessment": "<brief overall assessment>",
+      "improvement_suggestions": ["<suggestion 1>", "<suggestion 2>", ...]
+  }}
+
+required_variables:
+  - analysis
+  - data_summary
+
+optional_variables: {}
+

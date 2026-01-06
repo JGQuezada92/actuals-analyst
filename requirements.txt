@@ -32,6 +32,8 @@ openpyxl>=3.1.0               # Excel workbook generation with charts
 
 # Utilities
 python-dotenv>=1.0.0          # Environment variable management
+pyyaml>=6.0.0                 # YAML parsing for prompt management
+pydantic>=2.0.0               # Data validation for LLM outputs
 
 # Development & Testing
 pytest>=7.4.0

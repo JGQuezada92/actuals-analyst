@@ -17,6 +17,7 @@ from datetime import datetime
 from enum import Enum
 
 from src.core.model_router import get_router, get_judge_router, Message, LLMResponse
+from src.core.prompt_manager import get_prompt_manager
 from src.tools.calculator import CalculationResult
 from config.settings import get_config, EvaluationConfig
 
@@ -203,6 +204,7 @@ Respond in JSON format exactly as follows:
     def __init__(self):
         # Use judge router (different model from generator)
         self.router = get_judge_router()
+        self.prompt_manager = get_prompt_manager()
     
     def evaluate(
         self,
@@ -219,14 +221,26 @@ Respond in JSON format exactly as follows:
         Returns:
             Tuple of (list of dimension scores, average score, improvement suggestions)
         """
-        prompt = self.EVALUATION_PROMPT.format(
+        # Use prompt manager for versioned prompts
+        try:
+            eval_prompt = self.prompt_manager.get_prompt("evaluation")
+            user_prompt = eval_prompt.format(
+                analysis=analysis,
+                data_summary=data_summary,
+            )
+            system_prompt = eval_prompt.system_prompt
+        except FileNotFoundError:
+            # Fallback to inline prompt
+            logger.warning("Evaluation prompt not found, using inline prompt")
+            user_prompt = self.EVALUATION_PROMPT.format(
             analysis=analysis,
             data_summary=data_summary,
         )
+            system_prompt = "You are a rigorous financial analysis evaluator. Respond only in valid JSON."
         
         response = self.router.generate_with_system(
-            system_prompt="You are a rigorous financial analysis evaluator. Respond only in valid JSON.",
-            user_message=prompt,
+            system_prompt=system_prompt,
+            user_message=user_prompt,
             temperature=0.1,  # Low temperature for consistent evaluation
         )
         

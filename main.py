@@ -208,6 +208,195 @@ def cmd_registry_stats(args):
         print(f"\nError: {e}")
 
 
+def cmd_traces(args):
+    """View and analyze traces."""
+    from pathlib import Path
+    import json
+    from datetime import datetime
+    
+    traces_dir = Path(os.getenv("TRACE_EXPORT_DIR", "traces"))
+    
+    if args.list:
+        # List recent traces
+        traces = sorted(traces_dir.glob("trace_*.json"), reverse=True)[:args.limit]
+        
+        print("\n" + "=" * 80)
+        print("RECENT TRACES")
+        print("=" * 80)
+        print(f"{'Trace ID':<40} {'Duration':<12} {'Cost':<10} {'Status':<8}")
+        print("-" * 80)
+        
+        for trace_file in traces:
+            try:
+                with open(trace_file) as f:
+                    trace = json.load(f)
+                print(
+                    f"{trace['trace_id']:<40} "
+                    f"{trace['duration_ms']:.0f}ms{'':<6} "
+                    f"${trace['metrics']['estimated_cost_usd']:.4f}{'':<4} "
+                    f"{trace['status']}"
+                )
+            except Exception as e:
+                print(f"{trace_file.name}: Error reading trace - {e}")
+    
+    elif args.view:
+        # View specific trace
+        trace_file = traces_dir / f"{args.view}.json"
+        if not trace_file.exists():
+            print(f"Trace not found: {args.view}")
+            return
+        
+        with open(trace_file) as f:
+            trace = json.load(f)
+        
+        print("\n" + "=" * 80)
+        print(f"TRACE: {trace['trace_id']}")
+        print("=" * 80)
+        print(f"Query: {trace['query']}")
+        print(f"Duration: {trace['duration_ms']:.0f}ms")
+        print(f"Status: {trace['status']}")
+        print(f"\nMetrics:")
+        for key, value in trace['metrics'].items():
+            print(f"  {key}: {value}")
+        
+        print(f"\nSpans ({len(trace['spans'])}):")
+        for span in trace['spans']:
+            indent = "  " if span.get('parent_span_id') else ""
+            print(f"{indent}- {span['name']}: {span['duration_ms']:.0f}ms [{span['status']}]")
+            if span.get('llm_usage'):
+                usage = span['llm_usage']
+                print(f"{indent}  LLM: {usage['model']} ({usage['total_tokens']} tokens, ${usage['estimated_cost_usd']:.4f})")
+    
+    elif args.stats:
+        # Show aggregate statistics
+        traces = list(traces_dir.glob("trace_*.json"))
+        
+        if not traces:
+            print("No traces found.")
+            return
+        
+        total_cost = 0
+        total_duration = 0
+        total_tokens = 0
+        success_count = 0
+        
+        for trace_file in traces:
+            try:
+                with open(trace_file) as f:
+                    trace = json.load(f)
+                total_cost += trace['metrics']['estimated_cost_usd']
+                total_duration += trace['duration_ms']
+                total_tokens += trace['metrics']['total_tokens']
+                if trace['status'] == 'ok':
+                    success_count += 1
+            except Exception:
+                continue
+        
+        print("\n" + "=" * 60)
+        print("TRACE STATISTICS")
+        print("=" * 60)
+        print(f"Total Traces: {len(traces)}")
+        print(f"Success Rate: {success_count/len(traces)*100:.1f}%")
+        print(f"Total Cost: ${total_cost:.4f}")
+        print(f"Avg Cost/Query: ${total_cost/len(traces):.4f}")
+        print(f"Total Tokens: {total_tokens:,}")
+        print(f"Avg Duration: {total_duration/len(traces):.0f}ms")
+
+def cmd_regression(args):
+    """Run regression tests against a golden dataset."""
+    import asyncio
+    import json
+    import sys
+    from pathlib import Path
+    from datetime import datetime
+    from tests.golden_dataset import GoldenDataset, run_regression_suite
+    from src.agents.financial_analyst import get_financial_analyst
+    
+    dataset_path = Path(args.dataset)
+    if not dataset_path.exists():
+        print(f"Dataset not found: {dataset_path}")
+        return
+    
+    logger.info(f"Loading golden dataset from {dataset_path}")
+    dataset = GoldenDataset.load(dataset_path)
+    
+    logger.info(f"Loaded {len(dataset.test_cases)} test cases")
+    
+    agent = get_financial_analyst()
+    
+    report = asyncio.run(run_regression_suite(
+        agent=agent,
+        dataset=dataset,
+        parallel=args.parallel,
+    ))
+    
+    # Print summary
+    report.print_summary()
+    
+    # Save detailed results
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        output_path = Path("regression_results") / f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_path, 'w') as f:
+        json.dump(report.to_dict(), f, indent=2)
+    
+    print(f"\nDetailed results saved to: {output_path}")
+    
+    # Exit with error code if tests failed
+    if report.failed > 0 or report.errors > 0:
+        sys.exit(1)
+
+def cmd_prompts(args):
+    """Manage prompts."""
+    from src.core.prompt_manager import get_prompt_manager
+    
+    pm = get_prompt_manager()
+    
+    if args.action == 'list':
+        prompts = pm.list_prompts()
+        active = pm.get_active_versions()
+        
+        print("\n" + "=" * 60)
+        print("AVAILABLE PROMPTS")
+        print("=" * 60)
+        
+        for name, versions in sorted(prompts.items()):
+            active_version = active.get(name, versions[-1] if versions else "N/A")
+            print(f"\n{name}:")
+            for v in versions:
+                marker = " (active)" if v == active_version else ""
+                print(f"  - v{v}{marker}")
+    
+    elif args.action == 'show':
+        try:
+            prompt = pm.get_prompt(args.name, getattr(args, 'version', None))
+            
+            print("\n" + "=" * 60)
+            print(f"PROMPT: {prompt.name} v{prompt.version}")
+            print("=" * 60)
+            print(f"Description: {prompt.description}")
+            print(f"Hash: {prompt.hash}")
+            print(f"Created: {prompt.created_at}")
+            print(f"\nSystem Prompt:\n{'-' * 40}")
+            print(prompt.system_prompt[:500] + "..." if len(prompt.system_prompt) > 500 else prompt.system_prompt)
+            print(f"\nUser Template:\n{'-' * 40}")
+            print(prompt.user_prompt_template[:500] + "..." if len(prompt.user_prompt_template) > 500 else prompt.user_prompt_template)
+            print(f"\nRequired Variables: {prompt.required_variables}")
+            print(f"Optional Variables: {list(prompt.optional_variables.keys())}")
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+    
+    elif args.action == 'set-active':
+        try:
+            pm.set_active_version(args.name, args.version)
+            print(f"Set active version for '{args.name}' to v{args.version}")
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+
 def cmd_setup(args):
     """Validate configuration and setup."""
     from config.settings import get_config, MODEL_REGISTRY
@@ -407,6 +596,47 @@ Environment Variables:
     interactive_parser.add_argument('--iterations', type=int, default=2,
                                    help='Max reflection iterations (default: 2)')
     interactive_parser.set_defaults(func=cmd_interactive)
+    
+    # Traces command
+    traces_parser = subparsers.add_parser('traces', help='View and analyze traces')
+    traces_parser.add_argument('--list', action='store_true', help='List recent traces')
+    traces_parser.add_argument('--view', type=str, help='View specific trace by ID')
+    traces_parser.add_argument('--stats', action='store_true', help='Show aggregate statistics')
+    traces_parser.add_argument('--limit', type=int, default=20, help='Number of traces to list')
+    traces_parser.set_defaults(func=cmd_traces)
+    
+    # Regression command
+    regression_parser = subparsers.add_parser('regression', help='Run regression tests')
+    regression_parser.add_argument('dataset', help='Path to golden dataset JSON file')
+    regression_parser.add_argument('--parallel', action='store_true', help='Run tests in parallel')
+    regression_parser.add_argument('--output', '-o', help='Output path for detailed results')
+    regression_parser.set_defaults(func=cmd_regression)
+    
+    # Prompts command
+    prompts_parser = subparsers.add_parser('prompts', help='Manage prompts')
+    prompts_subparsers = prompts_parser.add_subparsers(dest='action')
+    
+    list_parser = prompts_subparsers.add_parser('list', help='List all prompts')
+    list_parser.set_defaults(func=lambda args: cmd_prompts(type('Args', (), {'action': 'list', 'name': None, 'version': None})()))
+    
+    show_parser = prompts_subparsers.add_parser('show', help='Show a prompt')
+    show_parser.add_argument('name', help='Prompt name')
+    show_parser.add_argument('--version', '-v', help='Specific version')
+    show_parser.set_defaults(func=lambda args: cmd_prompts(type('Args', (), {'action': 'show', 'name': args.name, 'version': getattr(args, 'version', None)})()))
+    
+    setactive_parser = prompts_subparsers.add_parser('set-active', help='Set active version')
+    setactive_parser.add_argument('name', help='Prompt name')
+    setactive_parser.add_argument('version', help='Version to activate')
+    setactive_parser.set_defaults(func=lambda args: cmd_prompts(type('Args', (), {'action': 'set-active', 'name': args.name, 'version': args.version})()))
+    
+    def cmd_prompts_wrapper(args):
+        """Wrapper for prompts command to handle subparsers."""
+        if hasattr(args, 'action'):
+            cmd_prompts(args)
+        else:
+            prompts_parser.print_help()
+    
+    prompts_parser.set_defaults(func=cmd_prompts_wrapper)
     
     args = parser.parse_args()
     
