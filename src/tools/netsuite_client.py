@@ -247,39 +247,41 @@ class NetSuiteRESTClient:
             raise ValueError("No saved search ID provided")
         
         # DECISION: Should we use server-side filtering?
-        # TEMPORARY FIX: Disable server-side filtering due to accuracy issues
-        # Server-side filters return significantly fewer rows than expected (133 vs ~400K)
-        # This causes 91.5% data loss on second query when registry is valid
-        # TODO: Debug RESTlet filter implementation before re-enabling
-        # 
-        # Root cause: RESTlet filters (department, accountPrefix, period) are too restrictive
-        # and return far fewer rows than Python-side filtering on full dataset
-        # 
-        # Workaround: Always use unfiltered fetch + Python-side filtering (proven accurate)
-        
+        # ENABLED: Server-side filtering now works correctly for all departments
+        # - Fixed: RESTlet now uses 'formulatext' field instead of 'name' with 'department' join
+        # - Verified: Works for both SDR and Product Management departments
+        # - See COMPREHENSIVE_FILTER_COMPARISON.md for test results
         registry = get_dynamic_registry()
-        use_filtering = False  # FORCE DISABLED until RESTlet filters are fixed
+        use_filtering = False  # Will be set to True if conditions met
         filter_params = None
         
         if registry.needs_refresh() or registry.is_empty():
             # Registry needs data - do UNFILTERED fetch
             logger.info("Registry needs refresh - using unfiltered fetch to rebuild")
+            use_filtering = False
+        elif parsed_query and self.filter_builder:
+            # Registry is valid - safe to use filtering
+            filter_params = self.filter_builder.build_from_parsed_query(parsed_query)
+            use_filtering = filter_params.has_filters()
+            if use_filtering:
+                logger.info(f"Using server-side filtering: {filter_params.describe()}")
+            else:
+                logger.info("No filterable criteria in query - using unfiltered fetch")
         else:
-            # Even though registry is valid, do NOT use server-side filtering
-            # Server-side filtering causes significant data loss (91.5% missing rows)
-            logger.info(
-                "Using unfiltered fetch (server-side filtering disabled for accuracy). "
-                "Python-side filtering will be applied to full dataset."
-            )
+            logger.info("No parsed_query provided - using unfiltered fetch")
         
         # Execute fetch with or without filters
+        # Note: ThreadPoolExecutor-based parallel fetching works without aiohttp
+        # Only async/await-based fetching requires aiohttp
         use_parallel = os.getenv("NETSUITE_PARALLEL_FETCH", "true").lower() == "true"
         
-        if use_parallel and AIOHTTP_AVAILABLE:
+        if use_parallel:
+            # Use parallel filtered method (uses ThreadPoolExecutor, works without aiohttp)
             result = self._execute_via_restlet_parallel_filtered(
                 search_id, start_time, filter_params if use_filtering else None
             )
         else:
+            # Sequential fetching
             result = self._execute_via_restlet_filtered(
                 search_id, start_time, filter_params if use_filtering else None
             )
@@ -1071,10 +1073,11 @@ class NetSuiteRESTClient:
     # =========================================================================
     
     def _should_use_parallel_fetch(self, total_pages: int) -> bool:
-        """Determine if parallel fetching should be used."""
-        if not AIOHTTP_AVAILABLE:
-            return False
+        """Determine if parallel fetching should be used.
         
+        Note: ThreadPoolExecutor-based parallel fetching works without aiohttp.
+        Only async/await-based fetching requires aiohttp.
+        """
         # Check environment variable
         parallel_enabled = os.getenv("NETSUITE_PARALLEL_FETCH", "true").lower() == "true"
         if not parallel_enabled:

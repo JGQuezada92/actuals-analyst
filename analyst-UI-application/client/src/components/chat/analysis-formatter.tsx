@@ -1,7 +1,7 @@
 import React from 'react';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { TrendingUp, TrendingDown, Minus, DollarSign, Percent, BarChart3 } from 'lucide-react';
+import { TrendingUp, TrendingDown, Minus, DollarSign, Percent, BarChart3, AlertTriangle, FileText, PieChart } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 interface AnalysisFormatterProps {
@@ -12,17 +12,35 @@ export function AnalysisFormatter({ content }: AnalysisFormatterProps) {
   // Parse the content - handle both JSON strings and plain markdown
   let analysisText = content;
   
+  // Handle content that might be wrapped in markdown code blocks or have prefixes
+  let cleanedContent = content.trim();
+  
+  // Remove markdown code block wrappers if present
+  if (cleanedContent.startsWith('```json')) {
+    cleanedContent = cleanedContent.replace(/^```json\n?/, '').replace(/\n?```$/, '');
+  } else if (cleanedContent.startsWith('```')) {
+    cleanedContent = cleanedContent.replace(/^```\w*\n?/, '').replace(/\n?```$/, '');
+  }
+  
+  // Remove "json " prefix if present
+  if (cleanedContent.startsWith('json ')) {
+    cleanedContent = cleanedContent.substring(5);
+  }
+  
   try {
     // Try to parse as JSON first (in case it's wrapped)
-    const parsed = JSON.parse(content);
-    if (parsed.analysis) {
+    const parsed = JSON.parse(cleanedContent);
+    if (parsed.analysis && typeof parsed.analysis === 'string') {
       analysisText = parsed.analysis;
     } else if (typeof parsed === 'string') {
       analysisText = parsed;
+    } else {
+      // If it's an object but no analysis field, try to stringify and use as-is
+      analysisText = cleanedContent;
     }
   } catch {
-    // Not JSON, use as-is
-    analysisText = content;
+    // Not JSON, use cleaned content as-is
+    analysisText = cleanedContent;
   }
 
   // Split into sections
@@ -30,6 +48,13 @@ export function AnalysisFormatter({ content }: AnalysisFormatterProps) {
 
   return (
     <div className="space-y-6">
+      {/* Main Title */}
+      {sections.title && (
+        <div className="mb-4">
+          <h2 className="text-xl font-bold text-gray-900">{sections.title}</h2>
+        </div>
+      )}
+
       {/* Executive Summary */}
       {sections.executiveSummary && (
         <Card className="p-5 bg-gradient-to-br from-emerald-50 to-white border-emerald-200">
@@ -69,6 +94,19 @@ export function AnalysisFormatter({ content }: AnalysisFormatterProps) {
         </Card>
       )}
 
+      {/* Financial Breakdown */}
+      {sections.financialBreakdown && (
+        <Card className="p-5 border-gray-200">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3 flex items-center gap-2">
+            <PieChart className="h-4 w-4 text-emerald-600" />
+            Financial Breakdown
+          </h3>
+          <div className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap">
+            {formatText(sections.financialBreakdown)}
+          </div>
+        </Card>
+      )}
+
       {/* Trend Analysis */}
       {sections.trendAnalysis && (
         <Card className="p-5 border-gray-200">
@@ -78,6 +116,19 @@ export function AnalysisFormatter({ content }: AnalysisFormatterProps) {
           </h3>
           <div className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap">
             {formatText(sections.trendAnalysis)}
+          </div>
+        </Card>
+      )}
+
+      {/* Risk Assessment */}
+      {sections.riskAssessment && (
+        <Card className="p-5 border-orange-200 bg-orange-50/50">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3 flex items-center gap-2">
+            <AlertTriangle className="h-4 w-4 text-orange-600" />
+            Risk Assessment
+          </h3>
+          <div className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap">
+            {formatText(sections.riskAssessment)}
           </div>
         </Card>
       )}
@@ -104,11 +155,27 @@ export function AnalysisFormatter({ content }: AnalysisFormatterProps) {
         </Card>
       )}
 
+      {/* Appendix */}
+      {sections.appendix && (
+        <Card className="p-5 border-gray-200 bg-gray-50/50">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3 flex items-center gap-2">
+            <FileText className="h-4 w-4 text-gray-600" />
+            Appendix
+          </h3>
+          <div className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap">
+            {formatText(sections.appendix)}
+          </div>
+        </Card>
+      )}
+
       {/* Other sections */}
       {sections.other && sections.other.length > 0 && (
         <div className="space-y-4">
           {sections.other.map((section, i) => (
             <Card key={i} className="p-5 border-gray-200">
+              {section.title && (
+                <h3 className="text-sm font-semibold text-gray-900 mb-3">{section.title}</h3>
+              )}
               <div className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap">
                 {formatText(section.content)}
               </div>
@@ -121,6 +188,8 @@ export function AnalysisFormatter({ content }: AnalysisFormatterProps) {
       {!sections.executiveSummary && 
        !sections.keyFindings?.length && 
        !sections.trendAnalysis && 
+       !sections.financialBreakdown &&
+       !sections.riskAssessment &&
        !sections.recommendations?.length && (
         <Card className="p-5 border-gray-200">
           <div className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap">
@@ -134,10 +203,14 @@ export function AnalysisFormatter({ content }: AnalysisFormatterProps) {
 
 function parseAnalysis(text: string) {
   const sections: {
+    title?: string;
     executiveSummary?: string;
     keyFindings?: string[];
+    financialBreakdown?: string;
     trendAnalysis?: string;
+    riskAssessment?: string;
     recommendations?: string[];
+    appendix?: string;
     other?: Array<{ title: string; content: string }>;
   } = {};
 
@@ -152,40 +225,90 @@ function parseAnalysis(text: string) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     
-    // Detect section headers
-    if (line.match(/^##?\s*(Executive Summary|Summary)/i)) {
+    // Detect main title (# header)
+    if (line.match(/^#\s+(.+)/) && !sections.title) {
+      const titleMatch = line.match(/^#\s+(.+)/);
+      if (titleMatch) {
+        sections.title = titleMatch[1];
+      }
+      continue;
+    }
+    
+    // Detect section headers (## headers)
+    if (line.match(/^##\s*(Executive Summary|Summary)/i)) {
       if (currentSection && currentContent.length > 0) {
-        sections[currentSection as keyof typeof sections] = currentContent.join('\n');
+        saveSection(sections, currentSection, currentContent, keyFindings, recommendations);
       }
       currentSection = 'executiveSummary';
       currentContent = [];
+      keyFindings = [];
+      recommendations = [];
       continue;
     }
     
-    if (line.match(/^##?\s*Key Findings/i)) {
-      if (currentSection && currentSection !== 'keyFindings' && currentContent.length > 0) {
-        sections[currentSection as keyof typeof sections] = currentContent.join('\n');
+    if (line.match(/^##\s*Key Findings/i)) {
+      if (currentSection && currentContent.length > 0) {
+        saveSection(sections, currentSection, currentContent, keyFindings, recommendations);
       }
       currentSection = 'keyFindings';
       currentContent = [];
+      keyFindings = [];
+      recommendations = [];
       continue;
     }
     
-    if (line.match(/^##?\s*Trend Analysis/i)) {
+    if (line.match(/^##\s*Financial Breakdown/i)) {
       if (currentSection && currentContent.length > 0) {
-        sections[currentSection as keyof typeof sections] = currentContent.join('\n');
+        saveSection(sections, currentSection, currentContent, keyFindings, recommendations);
+      }
+      currentSection = 'financialBreakdown';
+      currentContent = [];
+      keyFindings = [];
+      recommendations = [];
+      continue;
+    }
+    
+    if (line.match(/^##\s*Trend Analysis/i)) {
+      if (currentSection && currentContent.length > 0) {
+        saveSection(sections, currentSection, currentContent, keyFindings, recommendations);
       }
       currentSection = 'trendAnalysis';
       currentContent = [];
+      keyFindings = [];
+      recommendations = [];
       continue;
     }
     
-    if (line.match(/^##?\s*Recommendations/i)) {
-      if (currentSection && currentSection !== 'recommendations' && currentContent.length > 0) {
-        sections[currentSection as keyof typeof sections] = currentContent.join('\n');
+    if (line.match(/^##\s*Risk Assessment/i)) {
+      if (currentSection && currentContent.length > 0) {
+        saveSection(sections, currentSection, currentContent, keyFindings, recommendations);
+      }
+      currentSection = 'riskAssessment';
+      currentContent = [];
+      keyFindings = [];
+      recommendations = [];
+      continue;
+    }
+    
+    if (line.match(/^##\s*Recommendations/i)) {
+      if (currentSection && currentContent.length > 0) {
+        saveSection(sections, currentSection, currentContent, keyFindings, recommendations);
       }
       currentSection = 'recommendations';
       currentContent = [];
+      keyFindings = [];
+      recommendations = [];
+      continue;
+    }
+    
+    if (line.match(/^##\s*Appendix/i)) {
+      if (currentSection && currentContent.length > 0) {
+        saveSection(sections, currentSection, currentContent, keyFindings, recommendations);
+      }
+      currentSection = 'appendix';
+      currentContent = [];
+      keyFindings = [];
+      recommendations = [];
       continue;
     }
 
@@ -200,19 +323,18 @@ function parseAnalysis(text: string) {
         currentContent.push(line);
       }
     } else {
-      currentContent.push(line);
+      // Skip sub-headers (###) as they're part of the content
+      if (!line.match(/^###/)) {
+        currentContent.push(line);
+      } else {
+        currentContent.push(line);
+      }
     }
   }
 
   // Save final section
-  if (currentSection && currentContent.length > 0) {
-    if (currentSection === 'keyFindings' && keyFindings.length > 0) {
-      sections.keyFindings = keyFindings;
-    } else if (currentSection === 'recommendations' && recommendations.length > 0) {
-      sections.recommendations = recommendations;
-    } else {
-      sections[currentSection as keyof typeof sections] = currentContent.join('\n');
-    }
+  if (currentSection && (currentContent.length > 0 || keyFindings.length > 0 || recommendations.length > 0)) {
+    saveSection(sections, currentSection, currentContent, keyFindings, recommendations);
   }
 
   // If we have key findings or recommendations but no section header, extract them
@@ -232,6 +354,40 @@ function parseAnalysis(text: string) {
   }
 
   return sections;
+}
+
+function saveSection(
+  sections: any,
+  currentSection: string | null,
+  currentContent: string[],
+  keyFindings: string[],
+  recommendations: string[]
+) {
+  if (!currentSection) return;
+  
+  if (currentSection === 'keyFindings' && keyFindings.length > 0) {
+    sections.keyFindings = keyFindings;
+  } else if (currentSection === 'recommendations' && recommendations.length > 0) {
+    sections.recommendations = recommendations;
+  } else if (currentContent.length > 0) {
+    const content = currentContent.join('\n');
+    if (currentSection === 'executiveSummary' || 
+        currentSection === 'financialBreakdown' ||
+        currentSection === 'trendAnalysis' ||
+        currentSection === 'riskAssessment' ||
+        currentSection === 'appendix') {
+      sections[currentSection] = content;
+    } else {
+      // Store as other section
+      if (!sections.other) {
+        sections.other = [];
+      }
+      sections.other.push({
+        title: currentSection.charAt(0).toUpperCase() + currentSection.slice(1),
+        content: content
+      });
+    }
+  }
 }
 
 function formatText(text: string): React.ReactNode {

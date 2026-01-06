@@ -120,6 +120,7 @@ The RESTlet accepts the following query parameters:
 | `endDate` | string | End date (MM/DD/YYYY) | `01/31/2026` |
 | `dateField` | string | Date field for filtering | `formuladate` or `trandate` |
 | `department` | string | Comma-separated departments | `SDR,Marketing` |
+|              |        | Uses 'formulatext' field for hierarchical name matching | |
 | `accountPrefix` | string | Comma-separated account prefixes | `5,6` |
 | `accountName` | string | Account name contains | `Sales & Marketing` |
 | `transactionType` | string | Comma-separated transaction types | `Journal,VendBill` |

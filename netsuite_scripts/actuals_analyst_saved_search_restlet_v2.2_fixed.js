@@ -5,14 +5,27 @@
  * 
  * Enhanced RESTlet to execute saved searches with server-side filtering.
  * 
- * VERSION: 2.2 - Fixed period filter: now resolves period names to internal IDs
+ * VERSION: 2.4 - Fixed department filter to use base fields instead of formula field
  * 
- * CRITICAL FIX (v2.2):
- * The postingperiod field requires internal IDs, not text names.
- * This version looks up period internal IDs from period names before creating filters.
+ * CRITICAL FIX (v2.4):
+ * Department filter now uses base department fields (name+department join, direct department)
+ * instead of 'formulatext' formula field. Formula fields cannot be filtered in NetSuite
+ * saved searches, even though they appear in returned data.
  * 
- * FIXED IN THIS VERSION:
- * - Replaced log.warning() with log.audit() (SuiteScript 2.1 doesn't have log.warning)
+ * Previous v2.3 attempted to use 'formulatext' field which resulted in 0 rows because
+ * NetSuite doesn't allow filtering on formula/calculated fields in saved search filters.
+ * 
+ * STRATEGY (v2.4):
+ * 1. PRIMARY: Use 'name' field with 'department' join (works for most departments)
+ * 2. FALLBACK: Use direct 'department' field
+ * 3. REMOVED: formulatext (formula fields can't be filtered)
+ * 
+ * Note: If base fields don't work for specific departments, those will be filtered
+ * client-side in Python using formulatext from returned data.
+ * 
+ * PREVIOUS FIXES:
+ * - v2.2: Fixed period filter to resolve period names to internal IDs
+ * - v2.2: Replaced log.warning() with log.audit()
  * 
  * COMPATIBLE WITH: netsuite_filter_builder.py to_query_params()
  * 
@@ -423,31 +436,84 @@ define(['N/search', 'N/log'], function(search, log) {
         }
 
         // =====================================================================
-        // DEPARTMENT FILTER
+        // DEPARTMENT FILTER - v2.4
         // =====================================================================
+        // CRITICAL FIX: Use base department fields instead of formula field.
+        // 
+        // Issue with v2.3: 'formulatext' is a formula/calculated field which cannot
+        // be filtered in NetSuite saved searches, even though it appears in returned data.
+        // This caused 0 rows to be returned for all department queries.
+        //
+        // Solution (v2.4): Use base department fields that ARE filterable:
+        // 1. PRIMARY: 'name' field with 'department' join (works for most departments)
+        // 2. FALLBACK: Direct 'department' field
+        //
+        // Note: If base fields don't match all rows (e.g., short names like "SDR"),
+        // Python-side filtering will handle the remainder using 'formulatext' from
+        // returned data. This hybrid approach ensures accuracy.
         if (params.department) {
             var departments = params.department.split(',');
-            log.debug('Adding department filter', { departments: departments });
+            log.debug('Adding department filter (v2.4 - using base fields)', { departments: departments });
             
             departments.forEach(function(dept) {
                 var deptTrimmed = dept.trim();
                 if (deptTrimmed) {
-                    try {
-                        // Try 'name' field with 'department' join first
-                        filters.push(buildContainsFilter('name', deptTrimmed, 'department'));
-                    } catch (e) {
-                        log.debug('Department join filter failed, trying direct field');
+                    var filterCreated = false;
+                    var filterStrategy = 'none';
+                    
+                    // STRATEGY 1 (PRIMARY): Use 'name' field with 'department' join
+                    // This works for most departments including longer names like "Product Management"
+                    // For short names like "SDR", this may not match all rows, but will match some
+                    // Python-side filtering will catch the rest using formulatext
+                    if (!filterCreated) {
                         try {
-                            // Fallback to direct field
+                            filters.push(buildContainsFilter('name', deptTrimmed, 'department'));
+                            filterCreated = true;
+                            filterStrategy = 'name+department';
+                            log.debug('Department filter created', { 
+                                dept: deptTrimmed, 
+                                strategy: 'name with department join (PRIMARY)',
+                                note: 'May not match all rows for short names - Python will handle remainder'
+                            });
+                        } catch (e) {
+                            log.debug('name+department join filter failed, trying fallback', { 
+                                dept: deptTrimmed, 
+                                error: e.message 
+                            });
+                        }
+                    }
+                    
+                    // STRATEGY 2 (FALLBACK): Direct 'department' field
+                    // Use if join-based filter fails
+                    if (!filterCreated) {
+                        try {
                             filters.push(buildContainsFilter('department', deptTrimmed));
-                        } catch (e2) {
-                            log.error('Department filter error', { dept: deptTrimmed, error: e2.message });
+                            filterCreated = true;
+                            filterStrategy = 'direct';
+                            log.debug('Department filter created', { 
+                                dept: deptTrimmed, 
+                                strategy: 'direct department field (FALLBACK)'
+                            });
+                        } catch (e) {
+                            log.error('All department filter strategies failed', { 
+                                dept: deptTrimmed, 
+                                errors: ['name+department failed', e.message]
+                            });
                             errors.push({
                                 type: 'department',
                                 value: deptTrimmed,
-                                message: e2.message
+                                message: 'All filter strategies failed: ' + e.message
                             });
                         }
+                    }
+                    
+                    // Log the strategy used for debugging
+                    if (filterCreated) {
+                        log.audit('Department filter applied', {
+                            department: deptTrimmed,
+                            strategy: filterStrategy,
+                            note: 'If results are incomplete, Python-side filtering will handle remainder'
+                        });
                     }
                 }
             });
@@ -613,7 +679,7 @@ define(['N/search', 'N/log'], function(search, log) {
                 return {
                     success: false,
                     error: 'Missing required parameter: searchId',
-                    version: '2.2'
+                    version: '2.4'
                 };
             }
 
@@ -621,7 +687,7 @@ define(['N/search', 'N/log'], function(search, log) {
                 searchId: searchId, 
                 pageSize: pageSize, 
                 page: pageNum,
-                version: '2.2',
+                version: '2.4',
                 filters: {
                     periodNames: !!requestParams.periodNames,
                     dateRange: !!(requestParams.startDate && requestParams.endDate),
@@ -709,7 +775,7 @@ define(['N/search', 'N/log'], function(search, log) {
             // Build response
             var response = {
                 success: true,
-                version: '2.2',
+                version: '2.4',
                 searchId: searchId,
                 columns: columns,
                 totalResults: totalResults,
@@ -744,7 +810,7 @@ define(['N/search', 'N/log'], function(search, log) {
             
             return {
                 success: false,
-                version: '2.2',
+                version: '2.4',
                 error: e.message,
                 errorType: e.name || 'UNEXPECTED_ERROR',
                 errorStack: e.stack ? e.stack.split('\n') : [],
@@ -771,14 +837,14 @@ define(['N/search', 'N/log'], function(search, log) {
                 return {
                     success: false,
                     error: 'Missing required parameter: searchId',
-                    version: '2.2'
+                    version: '2.4'
                 };
             }
 
             log.audit('Executing saved search via POST', { 
                 searchId: searchId,
                 customFilterCount: customFilters.length,
-                version: '2.2'
+                version: '2.4'
             });
 
             var savedSearch = search.load({ id: searchId });
@@ -840,7 +906,7 @@ define(['N/search', 'N/log'], function(search, log) {
 
             return {
                 success: true,
-                version: '2.2',
+                version: '2.4',
                 searchId: searchId,
                 columns: columns,
                 totalResults: totalResults,
@@ -862,7 +928,7 @@ define(['N/search', 'N/log'], function(search, log) {
             
             return {
                 success: false,
-                version: '2.2',
+                version: '2.4',
                 error: e.message,
                 errorType: e.name || 'UNEXPECTED_ERROR',
                 errorStack: e.stack ? e.stack.split('\n') : [],
