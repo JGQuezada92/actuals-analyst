@@ -422,7 +422,7 @@ class NetSuiteRESTClient:
                 # Check for request limit exceeded error - don't continue!
                 if "SSS_REQUEST_LIMIT_EXCEEDED" in error_text or "REQUEST_LIMIT_EXCEEDED" in error_text:
                     logger.error(
-                        f"❌ NetSuite API request limit exceeded on page {current_page}. "
+                        f"[ERROR] NetSuite API request limit exceeded on page {current_page}. "
                         f"Stopping execution - retrying won't help."
                     )
                     raise NetSuiteRequestLimitExceededError(
@@ -459,7 +459,7 @@ class NetSuiteRESTClient:
                 # Check for request limit exceeded error - don't continue!
                 if "SSS_REQUEST_LIMIT_EXCEEDED" in str(error_msg) or "REQUEST_LIMIT_EXCEEDED" in str(error_msg):
                     logger.error(
-                        f"❌ NetSuite API request limit exceeded on page {current_page}. "
+                        f"[ERROR] NetSuite API request limit exceeded on page {current_page}. "
                         f"Stopping execution - retrying won't help."
                     )
                     raise NetSuiteRequestLimitExceededError(
@@ -567,7 +567,7 @@ class NetSuiteRESTClient:
             # Check for request limit exceeded error - don't continue!
             if "SSS_REQUEST_LIMIT_EXCEEDED" in error_text or "REQUEST_LIMIT_EXCEEDED" in error_text:
                 logger.error(
-                    f"❌ NetSuite API request limit exceeded on first page. "
+                    f"[ERROR] NetSuite API request limit exceeded on first page. "
                     f"Stopping execution - retrying won't help."
                 )
                 raise NetSuiteRequestLimitExceededError(
@@ -604,7 +604,7 @@ class NetSuiteRESTClient:
             # Check for request limit exceeded error - don't continue!
             if "SSS_REQUEST_LIMIT_EXCEEDED" in str(error_msg) or "REQUEST_LIMIT_EXCEEDED" in str(error_msg):
                 logger.error(
-                    f"❌ NetSuite API request limit exceeded on first page. "
+                    f"[ERROR] NetSuite API request limit exceeded on first page. "
                     f"Stopping execution - retrying won't help."
                 )
                 raise NetSuiteRequestLimitExceededError(
@@ -834,7 +834,7 @@ class NetSuiteRESTClient:
                         # Check for request limit exceeded error - don't retry this!
                         if "SSS_REQUEST_LIMIT_EXCEEDED" in str(error_msg) or "REQUEST_LIMIT_EXCEEDED" in str(error_msg):
                             logger.error(
-                                f"❌ NetSuite API request limit exceeded on page {page}. "
+                                f"[ERROR] NetSuite API request limit exceeded on page {page}. "
                                 f"Stopping execution - retrying won't help."
                             )
                             raise NetSuiteRequestLimitExceededError(
@@ -1182,7 +1182,7 @@ class NetSuiteRESTClient:
                         # Check for request limit exceeded error - don't retry this!
                         if "SSS_REQUEST_LIMIT_EXCEEDED" in text or "REQUEST_LIMIT_EXCEEDED" in text:
                             logger.error(
-                                f"❌ NetSuite API request limit exceeded on page {page}. "
+                                f"[ERROR] NetSuite API request limit exceeded on page {page}. "
                                 f"Stopping execution - retrying won't help."
                             )
                             raise NetSuiteRequestLimitExceededError(
@@ -1211,7 +1211,7 @@ class NetSuiteRESTClient:
                         # Check for request limit exceeded error - don't retry this!
                         if "SSS_REQUEST_LIMIT_EXCEEDED" in str(error_msg) or "REQUEST_LIMIT_EXCEEDED" in str(error_msg):
                             logger.error(
-                                f"❌ NetSuite API request limit exceeded on page {page}. "
+                                f"[ERROR] NetSuite API request limit exceeded on page {page}. "
                                 f"Stopping execution - retrying won't help."
                             )
                             raise NetSuiteRequestLimitExceededError(
@@ -1661,7 +1661,7 @@ class DataCache:
                 return None
             
             self._hits += 1
-            logger.info(f"✅ Cache hit for {cache_key} (age: {age_minutes:.1f} minutes, TTL: {self.ttl_minutes} minutes)")
+            logger.info(f"[OK] Cache hit for {cache_key} (age: {age_minutes:.1f} minutes, TTL: {self.ttl_minutes} minutes)")
             
             return SavedSearchResult(
                 data=cached["data"],
@@ -1846,10 +1846,10 @@ class NetSuiteDataRetriever:
             logger.info(f"Checking cache for key: {cache_key}")
             cached = self.cache.get(cache_key)
             if cached:
-                logger.info(f"✅ Cache hit for query {cache_key} ({cached.row_count} rows)")
+                logger.info(f"[OK] Cache hit for query {cache_key} ({cached.row_count} rows)")
                 return cached
             else:
-                logger.info(f"❌ Cache miss for filtered key: {cache_key}")
+                logger.info(f"[MISS] Cache miss for filtered key: {cache_key}")
             
             # If filtered cache miss, check for unfiltered cache (since filters are applied in Python)
             # This allows reusing the same underlying data for different filter combinations
@@ -1859,13 +1859,13 @@ class NetSuiteDataRetriever:
             unfiltered_cached = self.cache.get(unfiltered_cache_key)
             if unfiltered_cached:
                 logger.info(
-                    f"✅ Cache hit for unfiltered data ({unfiltered_cache_key}, {unfiltered_cached.row_count} rows). "
+                    f"[OK] Cache hit for unfiltered data ({unfiltered_cache_key}, {unfiltered_cached.row_count} rows). "
                     f"Filters will be applied in Python."
                 )
                 # Return the cached unfiltered data - filters will be applied later
                 return unfiltered_cached
             else:
-                logger.info(f"❌ Cache miss for unfiltered key: {unfiltered_cache_key}")
+                logger.info(f"[MISS] Cache miss for unfiltered key: {unfiltered_cache_key}")
                 
                 # Last resort: Check if ANY cache file exists for this search_id
                 # This handles the case where data was cached with a filtered key but we want to reuse it
@@ -1883,7 +1883,7 @@ class NetSuiteDataRetriever:
                                 age_minutes = (datetime.utcnow() - cached_time).total_seconds() / 60
                                 if age_minutes <= self.cache.ttl_minutes:
                                     logger.info(
-                                        f"✅ Found matching cache file: {cache_file.name} "
+                                        f"[OK] Found matching cache file: {cache_file.name} "
                                         f"(age: {age_minutes:.1f} minutes, rows: {cached_data.get('row_count', 0)})"
                                     )
                                     return SavedSearchResult(

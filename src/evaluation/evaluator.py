@@ -229,9 +229,12 @@ Respond in JSON format exactly as follows:
                 data_summary=data_summary,
             )
             system_prompt = eval_prompt.system_prompt
-        except FileNotFoundError:
+        except FileNotFoundError as e:
             # Fallback to inline prompt
-            logger.warning("Evaluation prompt not found, using inline prompt")
+            logger.warning(f"Evaluation prompt not found: {e}. Using inline prompt.")
+        except Exception as e:
+            # Catch other errors (e.g., missing variables, YAML parsing errors)
+            logger.warning(f"Evaluation prompt error: {e}. Using inline prompt.")
             user_prompt = self.EVALUATION_PROMPT.format(
             analysis=analysis,
             data_summary=data_summary,

@@ -950,7 +950,7 @@ class QueryParser:
                 # Normalize the department name (proper case)
                 # Convert "g&a (parent) : finance" → "G&A (Parent) : Finance"
                 dept_normalized = self._normalize_compound_department(dept)
-                logger.info(f"  Normalized '{dept}' → '{dept_normalized}'")
+                logger.info(f"  Normalized '{dept}' -> '{dept_normalized}'")
                 
                 if dept_normalized and dept_normalized not in departments:
                     departments.append(dept_normalized)
@@ -1056,16 +1056,19 @@ class QueryParser:
                 # Look for patterns like "Product Marketing", "Human Resources", etc.
                 # Extract 2-4 word phrases that appear before "department", "dept", or end of query
                 # Use case-insensitive matching and capture the actual text from query
-                # Patterns to match multi-word department names before "department", "dept", etc.
+                # Patterns to match department names before "department", "dept", etc.
+                # Includes both single-word (e.g., "ADR department") and multi-word (e.g., "Product Marketing department")
                 multi_word_patterns = [
-                    # Pattern 1: "for the X Y department" - most common pattern
+                    # Pattern 1: "for the X Y department" - most common pattern (2-4 words)
                     r'for\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept)',
-                    # Pattern 2: "X Y department" at word boundary
+                    # Pattern 2: "X Y department" at word boundary (2-4 words)
                     r'\b([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept|expense|cost|spend|spending)',
-                    # Pattern 3: "in the X Y department"
+                    # Pattern 3: "in the X Y department" (2-4 words)
                     r'in\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept)',
-                    # Pattern 4: "of the X Y department"
+                    # Pattern 4: "of the X Y department" (2-4 words)
                     r'of\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept)',
+                    # Pattern 5: Single-word department names (e.g., "ADR department", "IT department")
+                    r'\b([A-Z][A-Za-z0-9]{1,20})\s+(?:department|dept|expense|cost|spend|spending)',
                 ]
                 
                 for pattern_idx, pattern in enumerate(multi_word_patterns):
@@ -1084,21 +1087,20 @@ class QueryParser:
                             logger.debug(f"  Skipping '{phrase}' - range already claimed")
                             continue
                         
-                        # Skip single words (they'll be handled by individual patterns)
-                        if len(phrase.split()) < 2:
-                            logger.debug(f"  Skipping '{phrase}' - single word")
-                            continue
+                        # Handle single-word department names (e.g., "ADR department")
+                        is_single_word = len(phrase.split()) == 1
                         
-                        # Skip if phrase contains common stop words
-                        stop_words = {'the', 'for', 'in', 'of', 'and', 'or', 'to', 'from', 'with'}
-                        words = phrase.lower().split()
-                        if any(word in stop_words for word in words):
-                            logger.debug(f"  Skipping '{phrase}' - contains stop words")
-                            continue
+                        # Skip if phrase contains common stop words (but allow single words)
+                        if not is_single_word:
+                            stop_words = {'the', 'for', 'in', 'of', 'and', 'or', 'to', 'from', 'with'}
+                            words = phrase.lower().split()
+                            if any(word in stop_words for word in words):
+                                logger.debug(f"  Skipping '{phrase}' - contains stop words")
+                                continue
                         
-                        logger.info(f"Checking multi-word phrase '{phrase}' against registry")
+                        logger.info(f"Checking {'single-word' if is_single_word else 'multi-word'} department '{phrase}' against registry")
                         
-                        # Check registry for this multi-word phrase
+                        # Check registry for this department name (single or multi-word)
                         resolved, clarification = self._resolve_entity_dynamic(phrase, EntityType.DEPARTMENT)
                         
                         if resolved:
@@ -1107,11 +1109,11 @@ class QueryParser:
                                 if dept not in departments:
                                     departments.append(dept)
                                     claim_range(start, end)
-                                    logger.info(f"Matched multi-word department '{phrase}' → '{dept}'")
+                                    logger.info(f"Matched department '{phrase}' -> '{dept}'")
                             
                             # If we found a match, return early (don't split into individual words)
                             if departments:
-                                logger.info(f"Extracted multi-word departments: {departments}")
+                                logger.info(f"Extracted departments from registry: {departments}")
                                 return departments, clarification_needed
                         elif clarification:
                             # Multiple matches - try to find the best match by checking child part
@@ -1142,13 +1144,13 @@ class QueryParser:
                                     if best_match.canonical_name not in departments:
                                         departments.append(best_match.canonical_name)
                                         claim_range(start, end)
-                                        logger.info(f"Using best match: '{phrase}' → '{best_match.canonical_name}'")
+                                        logger.info(f"Using best match: '{phrase}' -> '{best_match.canonical_name}'")
                                     if departments:
                                         return departments, clarification_needed
                             
                             # If no best match found, return early with clarification to prevent splitting
                             clarification_needed = clarification
-                            logger.info(f"Multi-word phrase '{phrase}' matches multiple departments - returning early for clarification")
+                            logger.info(f"Department '{phrase}' matches multiple departments - returning early for clarification")
                             # Return empty departments list with clarification needed
                             return [], clarification_needed
             except Exception as e:
@@ -1178,7 +1180,7 @@ class QueryParser:
                 if dept_normalized and dept_normalized not in departments:
                     departments.append(dept_normalized)
                     claim_range(start, end)
-                    logger.debug(f"Static pattern matched: '{dept}' → '{dept_normalized}'")
+                    logger.debug(f"Static pattern matched: '{dept}' -> '{dept_normalized}'")
         
         if departments:
             logger.info(f"Extracted departments via static patterns: {departments}")

@@ -970,9 +970,12 @@ as "associated with" not "causes" unless there's clear causal reasoning.
                 statistical_context=statistical_context,
             )
             system_prompt = analysis_prompt.system_prompt
-        except FileNotFoundError:
+        except FileNotFoundError as e:
             # Fallback to inline prompts if prompt manager fails
-            logger.warning("Prompt manager failed, using inline prompts")
+            logger.warning(f"Prompt manager failed: {e}. Using inline prompts.")
+        except Exception as e:
+            # Catch other errors (e.g., missing variables, YAML parsing errors)
+            logger.warning(f"Prompt manager error: {e}. Using inline prompts.")
             user_prompt = f"""Analyze the following financial data and provide a professional analysis.
 
 ## User Query
