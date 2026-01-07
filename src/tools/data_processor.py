@@ -179,11 +179,15 @@ class DataProcessor:
         field_name: str = None
     ) -> FilterResult:
         """
-        Filter data to a specific department.
+        Filter data to a specific department using EXACT matching.
+        
+        Supports hierarchical department names (e.g., "R&D (Parent) : Product Management").
+        If department contains " : ", matches the full path exactly.
+        Otherwise, extracts the department part (after " : ") and matches exactly.
         
         Args:
             data: Raw data rows
-            department: Department name to filter by
+            department: Department name to filter by (exact match)
             field_name: Specific field to use (auto-detected if None)
         """
         field_name = field_name or self.find_field(data, "department")
@@ -197,17 +201,41 @@ class DataProcessor:
                 filters_applied=["department field not found"],
             )
         
-        dept_lower = department.lower()
-        filtered = [
-            row for row in data
-            if dept_lower in str(row.get(field_name, "")).lower()
-        ]
+        # Parse the requested department to handle hierarchical names
+        context = get_data_context()
+        dept_info = context.parse_department(department)
+        requested_dept_lower = dept_info.department_name.lower().strip()
+        requested_full_lower = department.lower().strip()
+        
+        # Check if user provided full path or just department name
+        has_hierarchy = " : " in department
+        
+        filtered = []
+        for row in data:
+            row_dept_raw = str(row.get(field_name, "")).strip()
+            if not row_dept_raw:
+                continue
+            
+            row_dept_lower = row_dept_raw.lower()
+            
+            # If user provided full hierarchical path, match exactly
+            if has_hierarchy:
+                if row_dept_lower == requested_full_lower:
+                    filtered.append(row)
+            else:
+                # User provided just department name - extract department part and match exactly
+                row_dept_info = context.parse_department(row_dept_raw)
+                row_dept_name_lower = row_dept_info.department_name.lower().strip()
+                
+                # Exact match on department name part
+                if row_dept_name_lower == requested_dept_lower:
+                    filtered.append(row)
         
         return FilterResult(
             data=filtered,
             original_count=len(data),
             filtered_count=len(filtered),
-            filters_applied=[f"{field_name} contains '{department}'"],
+            filters_applied=[f"{field_name} == '{department}' (exact match)"],
         )
     
     def filter_by_date_range(
@@ -717,17 +745,46 @@ class DataProcessor:
             result = filter_result.data
             all_filters.extend(filter_result.filters_applied)
         
-        # Apply department filter (OR logic for multiple departments)
+        # Apply department filter (OR logic for multiple departments) - EXACT MATCHING
         if departments:
             dept_field = self.find_field(result, "department")
             if dept_field:
+                context = get_data_context()
                 dept_filtered = []
                 for row in result:
-                    row_dept = str(row.get(dept_field, "")).lower()
-                    if any(d.lower() in row_dept for d in departments):
+                    row_dept_raw = str(row.get(dept_field, "")).strip()
+                    if not row_dept_raw:
+                        continue
+                    
+                    row_dept_lower = row_dept_raw.lower()
+                    
+                    # Check each requested department for exact match
+                    matched = False
+                    for dept in departments:
+                        dept_info = context.parse_department(dept)
+                        requested_dept_lower = dept_info.department_name.lower().strip()
+                        requested_full_lower = dept.lower().strip()
+                        
+                        # If user provided full hierarchical path, match exactly
+                        if " : " in dept:
+                            if row_dept_lower == requested_full_lower:
+                                matched = True
+                                break
+                        else:
+                            # User provided just department name - extract department part and match exactly
+                            row_dept_info = context.parse_department(row_dept_raw)
+                            row_dept_name_lower = row_dept_info.department_name.lower().strip()
+                            
+                            # Exact match on department name part
+                            if row_dept_name_lower == requested_dept_lower:
+                                matched = True
+                                break
+                    
+                    if matched:
                         dept_filtered.append(row)
+                
                 result = dept_filtered
-                all_filters.append(f"department in {departments}")
+                all_filters.append(f"department in {departments} (exact match)")
         
         # Apply account filter (OR logic for multiple accounts)
         if accounts:

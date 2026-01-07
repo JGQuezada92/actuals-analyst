@@ -33,22 +33,12 @@ class NetSuiteFilterParams:
     processed server-side to filter data before pagination.
     
     Primary date filter: periodNames (e.g., "Jan 2024,Feb 2024,Mar 2024")
-    - Python sends period NAMES (text strings like "Jan 2024", "Feb 2024")
-    - RESTlet v2.2+ converts names to internal IDs via lookupPeriodIds() function
-    - Creates postingperiod ANYOF filter with internal IDs (not text names)
-    - Falls back to date range (formuladate) if period lookup fails
-    - Returns filterWarnings for periods not found in NetSuite (non-fatal)
+    - Uses periodname field (text string: "Jan 2024", "Feb 2024")
+    - Matches export file's "Month-End Date (Text Format)" filter
+    - Falls back to date range (formuladate) if period filter fails server-side
     
-    This approach is transparent to Python code - just send period names
-    and the RESTlet handles the ID resolution server-side. The RESTlet v2.2+
-    follows a "graceful degradation" pattern:
-    1. Try period ID lookup → If fails, fall back to date range
-    2. Try date range on formuladate → If fails, fall back to trandate
-    3. Return warnings/errors in response, but continue processing other filters
-    4. Python client-side filtering catches anything server-side missed
-    
-    This ensures queries never fail due to filter issues - they just return
-    more data that gets filtered client-side.
+    The enhanced RESTlet handles filter failures gracefully and continues
+    without the failed filter, so client-side filtering provides a safety net.
     """
     period_names: Optional[List[str]] = None  # Accounting period names (e.g., ["Jan 2024", "Feb 2024"])
     start_date: Optional[str] = None  # MM/DD/YYYY format (fallback if period_names not provided)
@@ -74,9 +64,7 @@ class NetSuiteFilterParams:
         Convert to URL query parameters for the RESTlet.
         
         Sends period_names as primary filter, with date range as fallback.
-        RESTlet v2.2+ handles period name → ID conversion server-side via
-        lookupPeriodIds() function. If period lookup fails, RESTlet falls
-        back to date range filtering automatically.
+        The enhanced RESTlet supports both filtering approaches.
         
         Returns:
             Dict of parameter name to value, ready for URL encoding

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { useChatStore } from '@/stores/chat-store';
 import { ChatMessage, AgentResponse } from '@/types';
@@ -7,6 +7,7 @@ const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:3001';
 
 export function useSocket() {
   const socketRef = useRef<Socket | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
   const { addMessage, setLoading, setPhase } = useChatStore();
 
   useEffect(() => {
@@ -23,10 +24,12 @@ export function useSocket() {
 
     socket.on('connect', () => {
       console.log('✅ Connected to server');
+      setIsConnected(true);
     });
 
     socket.on('disconnect', () => {
       console.log('❌ Disconnected from server');
+      setIsConnected(false);
     });
 
     socket.on('chat:message:received', (data: { id: string }) => {
@@ -89,7 +92,7 @@ export function useSocket() {
   return {
     socket: socketRef.current,
     sendMessage,
-    isConnected: socketRef.current?.connected || false,
+    isConnected,
   };
 }
 

@@ -92,10 +92,12 @@ export class AgentBridge extends EventEmitter {
       proc.stdout.on('data', (data: Buffer) => {
         const chunk = data.toString();
         stdout += chunk;
-        // Log first few lines of stdout for debugging
-        const lines = chunk.split('\n').filter(l => l.trim());
-        if (lines.length > 0) {
-          console.log(`[Agent stdout] ${lines[0].substring(0, 200)}`);
+        // Log ALL stdout output for debugging
+        const lines = chunk.split('\n');
+        for (const line of lines) {
+          if (line.trim()) {
+            console.log(`[Agent stdout] ${line}`);
+          }
         }
         this.parseStreamingOutput(chunk, requestId, onProgress);
       });
@@ -103,7 +105,13 @@ export class AgentBridge extends EventEmitter {
       proc.stderr.on('data', (data: Buffer) => {
         const chunk = data.toString();
         stderr += chunk;
-        console.log(`[Agent stderr] ${chunk.trim()}`);
+        // Log ALL stderr output for debugging
+        const lines = chunk.split('\n');
+        for (const line of lines) {
+          if (line.trim()) {
+            console.log(`[Agent stderr] ${line}`);
+          }
+        }
         this.parseProgressOutput(chunk, requestId, onProgress);
       });
 

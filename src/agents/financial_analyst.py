@@ -314,7 +314,7 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         
         Args:
             parsed_query: The original parsed query with ambiguous terms
-            choices: Dict mapping term -> choice index
+            choices: Dict mapping term -> choice index (1-based for user-friendly display)
         
         Returns:
             Updated ParsedQuery with resolved semantic filters
@@ -322,6 +322,23 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         from src.core.financial_semantics import SemanticCategory
         
         for term, choice_index in choices.items():
+            # Check if this is a department disambiguation from registry
+            if term in parsed_query.department_disambiguation_options:
+                options = parsed_query.department_disambiguation_options[term]
+                # Convert 1-based user choice to 0-based index
+                user_choice = choice_index - 1 if choice_index > 0 else choice_index
+                if 0 <= user_choice < len(options):
+                    selected_dept = options[user_choice]
+                    # Replace the ambiguous term with the selected department
+                    if term in parsed_query.departments:
+                        parsed_query.departments.remove(term)
+                    parsed_query.departments.append(selected_dept)
+                    logger.info(f"Resolved department '{term}' to '{selected_dept}' (choice {choice_index})")
+                else:
+                    logger.warning(f"Invalid choice index {choice_index} for term '{term}' (options: {len(options)})")
+                continue
+            
+            # Handle semantic term disambiguation (existing logic)
             semantic_term = get_semantic_term(term)
             if semantic_term and semantic_term.disambiguation_required:
                 resolved = apply_disambiguation_choice(semantic_term, choice_index)
@@ -340,6 +357,7 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         parsed_query.requires_disambiguation = False
         parsed_query.disambiguation_message = None
         parsed_query.ambiguous_terms = []
+        parsed_query.department_disambiguation_options = {}
         
         return parsed_query
     

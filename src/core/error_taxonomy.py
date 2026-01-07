@@ -211,7 +211,44 @@ def classify_error(
         classified.context.update(context)
         return classified
     
+    # Check for NetSuite request limit exceeded exception
+    error_type_name = type(exception).__name__
+    if error_type_name == "NetSuiteRequestLimitExceededError":
+        return ClassifiedError(
+            category=ErrorCategory.RATE_LIMITED,
+            severity=ErrorSeverity.CRITICAL,
+            message=str(exception),
+            recoverable=False,
+            recovery_actions=[
+                RecoveryAction.abort(
+                    "NetSuite API request limit exceeded. "
+                    "Please wait before making more requests or reduce concurrent requests."
+                )
+            ],
+            original_exception=exception,
+            pipeline_phase=pipeline_phase,
+            context=context,
+        )
+    
     error_str = str(exception).lower()
+    
+    # NetSuite request limit exceeded - check first before generic rate limit
+    if "netsuite" in error_str and ("request limit exceeded" in error_str or "sss_request_limit_exceeded" in error_str):
+        return ClassifiedError(
+            category=ErrorCategory.RATE_LIMITED,
+            severity=ErrorSeverity.CRITICAL,
+            message=str(exception),
+            recoverable=False,
+            recovery_actions=[
+                RecoveryAction.abort(
+                    "NetSuite API request limit exceeded. "
+                    "Please wait before making more requests or reduce concurrent requests."
+                )
+            ],
+            original_exception=exception,
+            pipeline_phase=pipeline_phase,
+            context=context,
+        )
     
     # Rate limiting
     if "rate limit" in error_str or "429" in error_str:

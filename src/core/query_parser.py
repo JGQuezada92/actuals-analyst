@@ -100,6 +100,8 @@ class ParsedQuery:
     requires_disambiguation: bool = False
     disambiguation_message: Optional[str] = None
     ambiguous_terms: List[str] = field(default_factory=list)
+    # Department disambiguation options (NEW - for registry-based department matching)
+    department_disambiguation_options: Dict[str, List[str]] = field(default_factory=dict)  # term -> [options]
     
     # Resolved semantic terms for reference
     semantic_terms: List[Dict[str, Any]] = field(default_factory=list)
@@ -269,6 +271,11 @@ class QueryParser:
         # NEW: Extract semantic filters FIRST (this determines what is an account vs department)
         semantic_result = self._extract_semantic_filters(query)
         
+        # Initialize disambiguation variables early (used in department checking)
+        requires_disambiguation = semantic_result.get("requires_disambiguation", False)
+        disambiguation_message = semantic_result.get("disambiguation_message")
+        ambiguous_terms = semantic_result.get("ambiguous_terms", [])
+        
         # Extract intent
         intent = self._extract_intent(query_lower)
         notes.append(f"Detected intent: {intent.value}")
@@ -286,6 +293,9 @@ class QueryParser:
         # Extract departments (now aware of account-based terms and compound terms to exclude)
         semantic_matched_ranges = semantic_result.get("matched_ranges", [])
         departments, dept_clarification = self._extract_departments(query, semantic_matched_ranges)
+        
+        # Initialize department disambiguation options (will be populated if needed)
+        department_disambiguation_options = {}
         
         # Merge semantic department filters (avoid duplicates, case-insensitive)
         # BUT: If we have compound departments (containing ":"), don't merge individual parts
@@ -333,6 +343,63 @@ class QueryParser:
                     departments.append(dept)
                     existing_lower.append(dept.lower())
         
+        # NEW: Check departments against dynamic registry for disambiguation
+        # This prevents consolidating departments that should be distinct (e.g., "Product Marketing" vs "Product Management")
+        if departments and not requires_disambiguation:
+            registry = get_dynamic_registry()
+            if not registry.is_empty():
+                ambiguous_departments = []
+                resolved_departments = []
+                
+                for dept in departments:
+                    # Check if this department term matches multiple actual departments
+                    match = registry.lookup(dept, entity_type=EntityType.DEPARTMENT, min_confidence=0.3)
+                    
+                    if match.needs_clarification and len(match.clarification_options) > 1:
+                        # Multiple matches found - needs disambiguation
+                        ambiguous_departments.append({
+                            "term": dept,
+                            "options": match.clarification_options,
+                        })
+                        logger.info(
+                            f"Department '{dept}' matches multiple departments: {match.clarification_options}"
+                        )
+                    elif match.matches:
+                        # Single match or high confidence - use the canonical name
+                        canonical = match.matches[0].canonical_name
+                        if canonical not in resolved_departments:
+                            resolved_departments.append(canonical)
+                        logger.debug(f"Department '{dept}' resolved to '{canonical}'")
+                    else:
+                        # No match found - keep original (might be a new department or typo)
+                        if dept not in resolved_departments:
+                            resolved_departments.append(dept)
+                        logger.debug(f"Department '{dept}' not found in registry, keeping as-is")
+                
+                if ambiguous_departments:
+                    # Build disambiguation message
+                    clarification_parts = []
+                    for amb_dept in ambiguous_departments:
+                        options_str = "\n".join(
+                            f"  {i+1}. {opt}" 
+                            for i, opt in enumerate(amb_dept["options"][:10])
+                        )
+                        clarification_parts.append(
+                            f'The department "{amb_dept["term"]}" matches multiple departments:\n'
+                            f'{options_str}\n\n'
+                            f'Which one did you mean? Please specify the exact department name (e.g., "1" for the first option).'
+                        )
+                        # Store options for later resolution
+                        department_disambiguation_options[amb_dept["term"]] = amb_dept["options"]
+                    
+                    requires_disambiguation = True
+                    disambiguation_message = "\n\n".join(clarification_parts)
+                    ambiguous_terms.extend([d["term"] for d in ambiguous_departments])
+                    logger.info(f"Department disambiguation required for: {ambiguous_terms}")
+                else:
+                    # All departments resolved - use resolved canonical names
+                    departments = resolved_departments
+        
         if departments:
             notes.append(f"Departments: {departments}")
         
@@ -355,9 +422,7 @@ class QueryParser:
         account_type_filter = semantic_result.get("account_type_filter")
         account_name_filter = semantic_result.get("account_name_filter")  # NEW
         transaction_type_filter = semantic_result.get("transaction_type_filter")
-        requires_disambiguation = semantic_result.get("requires_disambiguation", False)
-        disambiguation_message = semantic_result.get("disambiguation_message")
-        ambiguous_terms = semantic_result.get("ambiguous_terms", [])
+        # Note: requires_disambiguation, disambiguation_message, ambiguous_terms already initialized above
         semantic_terms = semantic_result.get("semantic_terms", [])
         is_consolidated = semantic_result.get("is_consolidated", False)
         
@@ -419,6 +484,7 @@ class QueryParser:
             requires_disambiguation=requires_disambiguation,
             disambiguation_message=disambiguation_message,
             ambiguous_terms=ambiguous_terms,
+            department_disambiguation_options=department_disambiguation_options,
             semantic_terms=semantic_terms,
             top_n=top_n,
             group_by=group_by,
@@ -939,6 +1005,110 @@ class QueryParser:
         if departments:
             logger.info(f"Extracted departments from registry: {departments}")
             return departments, clarification_needed
+        
+        # =========================================================================
+        # STEP 2.5: Check for multi-word department names BEFORE splitting into words
+        # =========================================================================
+        # This handles cases like "Product Marketing" which should be treated as a single
+        # department name, not split into "Product" and "Marketing"
+        if DYNAMIC_REGISTRY_AVAILABLE and self.dynamic_registry and not self.dynamic_registry.is_empty():
+            try:
+                # Extract multi-word phrases that might be department names
+                # Look for patterns like "Product Marketing", "Human Resources", etc.
+                # Extract 2-4 word phrases that appear before "department", "dept", or end of query
+                # Use case-insensitive matching and capture the actual text from query
+                multi_word_patterns = [
+                    r'\b([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept|expense|cost|spend|spending)',
+                    r'for\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept)',
+                    r'in\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept)',
+                    r'of\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept)',
+                ]
+                
+                for pattern_idx, pattern in enumerate(multi_word_patterns):
+                    matches = list(re.finditer(pattern, query, re.IGNORECASE))
+                    logger.debug(f"Multi-word pattern {pattern_idx+1} ('{pattern[:50]}...') found {len(matches)} matches")
+                    
+                    for match in matches:
+                        phrase = match.group(1).strip()
+                        start, end = match.span(1)
+                        actual_text = query[start:end]
+                        
+                        logger.debug(f"  Match: '{phrase}' (actual text: '{actual_text}') at position {start}:{end}")
+                        
+                        # Skip if already claimed
+                        if is_range_claimed(start, end):
+                            logger.debug(f"  Skipping '{phrase}' - range already claimed")
+                            continue
+                        
+                        # Skip single words (they'll be handled by individual patterns)
+                        if len(phrase.split()) < 2:
+                            logger.debug(f"  Skipping '{phrase}' - single word")
+                            continue
+                        
+                        # Skip if phrase contains common stop words
+                        stop_words = {'the', 'for', 'in', 'of', 'and', 'or', 'to', 'from', 'with'}
+                        words = phrase.lower().split()
+                        if any(word in stop_words for word in words):
+                            logger.debug(f"  Skipping '{phrase}' - contains stop words")
+                            continue
+                        
+                        logger.info(f"Checking multi-word phrase '{phrase}' against registry")
+                        
+                        # Check registry for this multi-word phrase
+                        resolved, clarification = self._resolve_entity_dynamic(phrase, EntityType.DEPARTMENT)
+                        
+                        if resolved:
+                            # Found exact match - use it
+                            for dept in resolved:
+                                if dept not in departments:
+                                    departments.append(dept)
+                                    claim_range(start, end)
+                                    logger.info(f"Matched multi-word department '{phrase}' → '{dept}'")
+                            
+                            # If we found a match, return early (don't split into individual words)
+                            if departments:
+                                logger.info(f"Extracted multi-word departments: {departments}")
+                                return departments, clarification_needed
+                        elif clarification:
+                            # Multiple matches - try to find the best match by checking child part
+                            # For hierarchical departments like "Marketing (Parent) : Product Marketing",
+                            # prefer matches where the child part exactly matches the search phrase
+                            registry = get_dynamic_registry()
+                            if not registry.is_empty():
+                                match_result = registry.lookup(phrase, entity_type=EntityType.DEPARTMENT, min_confidence=0.3)
+                                
+                                # Check if any match has the phrase as the child part (after ":")
+                                best_match = None
+                                phrase_lower = phrase.lower()
+                                
+                                for entry in match_result.matches:
+                                    canonical_lower = entry.canonical_name.lower()
+                                    if ' : ' in canonical_lower:
+                                        # Extract child part (after ":")
+                                        child_part = canonical_lower.split(' : ', 1)[1].strip()
+                                        # Check if phrase matches child part exactly or closely
+                                        if phrase_lower == child_part or phrase_lower in child_part:
+                                            # Prefer this match
+                                            best_match = entry
+                                            logger.info(f"Found best match for '{phrase}': '{entry.canonical_name}' (child part matches)")
+                                            break
+                                
+                                if best_match:
+                                    # Use the best match
+                                    if best_match.canonical_name not in departments:
+                                        departments.append(best_match.canonical_name)
+                                        claim_range(start, end)
+                                        logger.info(f"Using best match: '{phrase}' → '{best_match.canonical_name}'")
+                                    if departments:
+                                        return departments, clarification_needed
+                            
+                            # If no best match found, return early with clarification to prevent splitting
+                            clarification_needed = clarification
+                            logger.info(f"Multi-word phrase '{phrase}' matches multiple departments - returning early for clarification")
+                            # Return empty departments list with clarification needed
+                            return [], clarification_needed
+            except Exception as e:
+                logger.warning(f"Multi-word department lookup failed: {e}")
         
         # =========================================================================
         # STEP 3: Fall back to individual static patterns

@@ -247,28 +247,21 @@ class NetSuiteRESTClient:
             raise ValueError("No saved search ID provided")
         
         # DECISION: Should we use server-side filtering?
-        # ENABLED: Server-side filtering now works correctly for all departments
-        # - Fixed: RESTlet now uses 'formulatext' field instead of 'name' with 'department' join
-        # - Verified: Works for both SDR and Product Management departments
-        # - See COMPREHENSIVE_FILTER_COMPARISON.md for test results
+        # TEMPORARY FIX: Disable server-side filtering due to accuracy issues
+        # Server-side filtering causes 91.5% data loss (133 rows vs ~400K expected)
+        # See SERVER_SIDE_FILTERING_FIX.md for details
         registry = get_dynamic_registry()
-        use_filtering = False  # Will be set to True if conditions met
+        use_filtering = False  # FORCE DISABLED until RESTlet filters are fixed
         filter_params = None
         
         if registry.needs_refresh() or registry.is_empty():
             # Registry needs data - do UNFILTERED fetch
             logger.info("Registry needs refresh - using unfiltered fetch to rebuild")
-            use_filtering = False
-        elif parsed_query and self.filter_builder:
-            # Registry is valid - safe to use filtering
-            filter_params = self.filter_builder.build_from_parsed_query(parsed_query)
-            use_filtering = filter_params.has_filters()
-            if use_filtering:
-                logger.info(f"Using server-side filtering: {filter_params.describe()}")
-            else:
-                logger.info("No filterable criteria in query - using unfiltered fetch")
         else:
-            logger.info("No parsed_query provided - using unfiltered fetch")
+            logger.info(
+                "Using unfiltered fetch (server-side filtering disabled for accuracy). "
+                "Python-side filtering will be applied to full dataset."
+            )
         
         # Execute fetch with or without filters
         # Note: ThreadPoolExecutor-based parallel fetching works without aiohttp
@@ -425,6 +418,18 @@ class NetSuiteRESTClient:
             
             if response.status_code != 200:
                 error_text = response.text[:1000] if response.text else "No response body"
+                
+                # Check for request limit exceeded error - don't continue!
+                if "SSS_REQUEST_LIMIT_EXCEEDED" in error_text or "REQUEST_LIMIT_EXCEEDED" in error_text:
+                    logger.error(
+                        f"❌ NetSuite API request limit exceeded on page {current_page}. "
+                        f"Stopping execution - retrying won't help."
+                    )
+                    raise NetSuiteRequestLimitExceededError(
+                        page=current_page,
+                        details=error_text[:500]
+                    )
+                
                 logger.error(
                     f"RESTlet HTTP error {response.status_code} for search {search_id} (page {current_page}):\n"
                     f"URL: {full_url[:200]}...\n"
@@ -450,6 +455,18 @@ class NetSuiteRESTClient:
             
             if not result.get("success"):
                 error_msg = result.get('error', 'Unknown error')
+                
+                # Check for request limit exceeded error - don't continue!
+                if "SSS_REQUEST_LIMIT_EXCEEDED" in str(error_msg) or "REQUEST_LIMIT_EXCEEDED" in str(error_msg):
+                    logger.error(
+                        f"❌ NetSuite API request limit exceeded on page {current_page}. "
+                        f"Stopping execution - retrying won't help."
+                    )
+                    raise NetSuiteRequestLimitExceededError(
+                        page=current_page,
+                        details=str(error_msg)
+                    )
+                
                 error_details = result.get('errorDetails', {})
                 error_stack = result.get('errorStack', '')
                 
@@ -546,6 +563,18 @@ class NetSuiteRESTClient:
         
         if response.status_code != 200:
             error_text = response.text[:1000] if response.text else "No response body"
+            
+            # Check for request limit exceeded error - don't continue!
+            if "SSS_REQUEST_LIMIT_EXCEEDED" in error_text or "REQUEST_LIMIT_EXCEEDED" in error_text:
+                logger.error(
+                    f"❌ NetSuite API request limit exceeded on first page. "
+                    f"Stopping execution - retrying won't help."
+                )
+                raise NetSuiteRequestLimitExceededError(
+                    page=0,
+                    details=error_text[:500]
+                )
+            
             logger.error(
                 f"RESTlet HTTP error {response.status_code} for search {search_id}:\n"
                 f"URL: {full_url[:200]}...\n"
@@ -571,6 +600,18 @@ class NetSuiteRESTClient:
         
         if not first_result.get("success"):
             error_msg = first_result.get('error', 'Unknown error')
+            
+            # Check for request limit exceeded error - don't continue!
+            if "SSS_REQUEST_LIMIT_EXCEEDED" in str(error_msg) or "REQUEST_LIMIT_EXCEEDED" in str(error_msg):
+                logger.error(
+                    f"❌ NetSuite API request limit exceeded on first page. "
+                    f"Stopping execution - retrying won't help."
+                )
+                raise NetSuiteRequestLimitExceededError(
+                    page=0,
+                    details=str(error_msg)
+                )
+            
             error_details = first_result.get('errorDetails', {})
             error_stack = first_result.get('errorStack', '')
             
@@ -790,22 +831,46 @@ class NetSuiteRESTClient:
                     else:
                         error_msg = result.get("error", "Unknown error")
                         
-                        # Check for rate limit in response body
-                        if "SSS_REQUEST_LIMIT_EXCEEDED" in str(error_msg):
-                            if attempt < max_retries:
-                                wait_time = (2 ** attempt) + random.uniform(0.5, 1.5)
-                                logger.warning(
-                                    f"Page {page} rate limited (attempt {attempt + 1}/{max_retries + 1}), "
-                                    f"waiting {wait_time:.1f}s..."
-                                )
-                                time.sleep(wait_time)
-                                continue
+                        # Check for request limit exceeded error - don't retry this!
+                        if "SSS_REQUEST_LIMIT_EXCEEDED" in str(error_msg) or "REQUEST_LIMIT_EXCEEDED" in str(error_msg):
+                            logger.error(
+                                f"❌ NetSuite API request limit exceeded on page {page}. "
+                                f"Stopping execution - retrying won't help."
+                            )
+                            raise NetSuiteRequestLimitExceededError(
+                                page=page,
+                                details=str(error_msg)
+                            )
                         
                         last_error = f"RESTlet error: {error_msg}"
                 
                 elif response.status_code == 400:
-                    # Bad request - likely OAuth signature issue or malformed request
+                    # Bad request - check if it's a request limit error
                     text = response.text[:500]
+                    
+                    # Check for request limit exceeded error - don't retry this!
+                    if "SSS_REQUEST_LIMIT_EXCEEDED" in text or "REQUEST_LIMIT_EXCEEDED" in text:
+                        logger.error(
+                            f"❌ NetSuite API request limit exceeded on page {page}. "
+                            f"Stopping execution - retrying won't help."
+                        )
+                        # Try to parse JSON error details if available
+                        error_details = None
+                        try:
+                            error_json = response.json()
+                            if isinstance(error_json, dict) and "error" in error_json:
+                                error_obj = error_json["error"]
+                                if isinstance(error_obj, dict):
+                                    error_details = error_obj.get("message", text)
+                        except:
+                            error_details = text
+                        
+                        raise NetSuiteRequestLimitExceededError(
+                            page=page,
+                            details=error_details
+                        )
+                    
+                    # Other 400 errors - likely OAuth signature issue or malformed request
                     logger.warning(f"Page {page} got 400 Bad Request: {text}")
                     
                     if attempt < max_retries:
@@ -1114,12 +1179,19 @@ class NetSuiteRESTClient:
                     if response.status != 200:
                         text = await response.text()
                         
-                        # Check if it's a rate limit error
-                        is_rate_limit = (
-                            response.status == 429 or 
-                            "SSS_REQUEST_LIMIT_EXCEEDED" in text or
-                            "REQUEST_LIMIT_EXCEEDED" in text
-                        )
+                        # Check for request limit exceeded error - don't retry this!
+                        if "SSS_REQUEST_LIMIT_EXCEEDED" in text or "REQUEST_LIMIT_EXCEEDED" in text:
+                            logger.error(
+                                f"❌ NetSuite API request limit exceeded on page {page}. "
+                                f"Stopping execution - retrying won't help."
+                            )
+                            raise NetSuiteRequestLimitExceededError(
+                                page=page,
+                                details=text[:500]
+                            )
+                        
+                        # Check if it's a regular rate limit (429) - these can be retried
+                        is_rate_limit = response.status == 429
                         
                         if is_rate_limit and attempt < max_retries:
                             # Exponential backoff: 2^attempt seconds
@@ -1136,17 +1208,16 @@ class NetSuiteRESTClient:
                     if not result.get("success"):
                         error_msg = result.get("error", "Unknown error")
                         
-                        # Check if it's a rate limit error in the response body
-                        is_rate_limit = (
-                            "SSS_REQUEST_LIMIT_EXCEEDED" in str(error_msg) or
-                            "REQUEST_LIMIT_EXCEEDED" in str(error_msg)
-                        )
-                        
-                        if is_rate_limit and attempt < max_retries:
-                            wait_time = 2 ** attempt
-                            logger.warning(f"Page {page} rate limited (attempt {attempt + 1}/{max_retries + 1}), waiting {wait_time}s...")
-                            await asyncio.sleep(wait_time)
-                            continue
+                        # Check for request limit exceeded error - don't retry this!
+                        if "SSS_REQUEST_LIMIT_EXCEEDED" in str(error_msg) or "REQUEST_LIMIT_EXCEEDED" in str(error_msg):
+                            logger.error(
+                                f"❌ NetSuite API request limit exceeded on page {page}. "
+                                f"Stopping execution - retrying won't help."
+                            )
+                            raise NetSuiteRequestLimitExceededError(
+                                page=page,
+                                details=str(error_msg)
+                            )
                         
                         raise DataRetrievalError(f"Page {page} error: {error_msg}")
                     
@@ -1523,6 +1594,7 @@ class DataCache:
         
         # Configurable TTL
         self.ttl_minutes = int(os.getenv("NETSUITE_CACHE_TTL_MINUTES", "15"))
+        logger.info(f"Cache TTL configured: {self.ttl_minutes} minutes")
         
         # Statistics
         self._hits = 0
@@ -1570,9 +1642,11 @@ class DataCache:
     def get(self, cache_key: str) -> Optional[SavedSearchResult]:
         """Get cached result if valid."""
         cache_path = self._get_cache_path(cache_key)
+        logger.debug(f"Cache lookup: key='{cache_key}', path='{cache_path.name}'")
         
         if not cache_path.exists():
             self._misses += 1
+            logger.debug(f"Cache file not found: {cache_path.name}")
             return None
         
         try:
@@ -1580,13 +1654,14 @@ class DataCache:
                 cached = json.load(f)
             
             cached_time = datetime.fromisoformat(cached["retrieved_at"])
-            if datetime.utcnow() - cached_time > timedelta(minutes=self.ttl_minutes):
+            age_minutes = (datetime.utcnow() - cached_time).total_seconds() / 60
+            if age_minutes > self.ttl_minutes:
                 self._misses += 1
-                logger.debug(f"Cache expired for {cache_key}")
+                logger.info(f"Cache expired for {cache_key}: {age_minutes:.1f} minutes old (TTL: {self.ttl_minutes} minutes)")
                 return None
             
             self._hits += 1
-            logger.debug(f"Cache hit for {cache_key}")
+            logger.info(f"✅ Cache hit for {cache_key} (age: {age_minutes:.1f} minutes, TTL: {self.ttl_minutes} minutes)")
             
             return SavedSearchResult(
                 data=cached["data"],
@@ -1766,12 +1841,66 @@ class NetSuiteDataRetriever:
         # Generate cache key based on query parameters
         cache_key = self._generate_cache_key(search_id, parsed_query)
         
-        # Check cache first
+        # Check cache first - try filtered cache key first
         if self.cache and not bypass_cache:
+            logger.info(f"Checking cache for key: {cache_key}")
             cached = self.cache.get(cache_key)
             if cached:
-                logger.info(f"Cache hit for query {cache_key}")
+                logger.info(f"✅ Cache hit for query {cache_key} ({cached.row_count} rows)")
                 return cached
+            else:
+                logger.info(f"❌ Cache miss for filtered key: {cache_key}")
+            
+            # If filtered cache miss, check for unfiltered cache (since filters are applied in Python)
+            # This allows reusing the same underlying data for different filter combinations
+            # IMPORTANT: Use the actual search_id, not "default", to match cached files
+            unfiltered_cache_key = search_id or "default"
+            logger.info(f"Checking unfiltered cache for key: '{unfiltered_cache_key}' (search_id: {search_id})")
+            unfiltered_cached = self.cache.get(unfiltered_cache_key)
+            if unfiltered_cached:
+                logger.info(
+                    f"✅ Cache hit for unfiltered data ({unfiltered_cache_key}, {unfiltered_cached.row_count} rows). "
+                    f"Filters will be applied in Python."
+                )
+                # Return the cached unfiltered data - filters will be applied later
+                return unfiltered_cached
+            else:
+                logger.info(f"❌ Cache miss for unfiltered key: {unfiltered_cache_key}")
+                
+                # Last resort: Check if ANY cache file exists for this search_id
+                # This handles the case where data was cached with a filtered key but we want to reuse it
+                if search_id:
+                    logger.info(f"Checking for any cached data matching search_id: {search_id}")
+                    # List all cache files and check if any contain this search_id
+                    cache_files = list(self.cache.cache_dir.glob("*.json"))
+                    for cache_file in cache_files:
+                        try:
+                            with open(cache_file, 'r') as f:
+                                cached_data = json.load(f)
+                            # Check if this cache file matches our search_id (even if key is different)
+                            if cached_data.get("search_id") == search_id or cached_data.get("search_id", "").startswith(search_id):
+                                cached_time = datetime.fromisoformat(cached_data["retrieved_at"])
+                                age_minutes = (datetime.utcnow() - cached_time).total_seconds() / 60
+                                if age_minutes <= self.cache.ttl_minutes:
+                                    logger.info(
+                                        f"✅ Found matching cache file: {cache_file.name} "
+                                        f"(age: {age_minutes:.1f} minutes, rows: {cached_data.get('row_count', 0)})"
+                                    )
+                                    return SavedSearchResult(
+                                        data=cached_data["data"],
+                                        search_id=cached_data["search_id"],
+                                        retrieved_at=cached_time,
+                                        row_count=cached_data["row_count"],
+                                        column_names=cached_data["column_names"],
+                                        execution_time_ms=cached_data["execution_time_ms"],
+                                    )
+                        except Exception as e:
+                            logger.debug(f"Error checking cache file {cache_file.name}: {e}")
+                            continue
+        elif bypass_cache:
+            logger.info("⚠️ Cache bypassed - forcing fresh data retrieval")
+        elif not self.cache:
+            logger.warning("⚠️ Cache not initialized - fetching fresh data")
         
         # Always use RESTlet for accurate financial data
         result = self.client.execute_saved_search(
@@ -1790,9 +1919,27 @@ class NetSuiteDataRetriever:
         if self._update_registry and result.data:
             self._maybe_update_registry(result.data)
         
-        # Cache result
+        # Cache result with both filtered and unfiltered keys
+        # This allows subsequent queries to reuse the same underlying data
         if self.cache:
+            # Cache with filtered key
             self.cache.set(result)
+            
+            # Also cache with unfiltered key (search_id only) if different
+            # This allows queries with different filters to reuse the same data
+            unfiltered_cache_key = search_id or "default"
+            if unfiltered_cache_key != cache_key:
+                # Create a copy with the unfiltered cache key
+                unfiltered_result = SavedSearchResult(
+                    data=result.data,  # Same data - filters applied in Python
+                    search_id=unfiltered_cache_key,
+                    retrieved_at=result.retrieved_at,
+                    row_count=result.row_count,
+                    column_names=result.column_names,
+                    execution_time_ms=result.execution_time_ms,
+                )
+                self.cache.set(unfiltered_result)
+                logger.debug(f"Cached unfiltered data with key: {unfiltered_cache_key}")
         
         return result
     
@@ -2031,6 +2178,27 @@ class AuthenticationError(Exception):
 class DataRetrievalError(Exception):
     """Raised when data retrieval fails."""
     pass
+
+class NetSuiteRequestLimitExceededError(Exception):
+    """
+    Raised when NetSuite API request limit is exceeded.
+    
+    This is a non-recoverable error - retrying won't help.
+    The user needs to wait for the limit to reset or reduce request frequency.
+    """
+    def __init__(self, message: str = None, page: int = None, details: str = None):
+        self.page = page
+        self.details = details
+        if message is None:
+            message = (
+                "NetSuite API request limit exceeded (SSS_REQUEST_LIMIT_EXCEEDED). "
+                "Please wait before making more requests or reduce the number of concurrent requests."
+            )
+            if page is not None:
+                message += f" Failed on page {page}."
+            if details:
+                message += f" Details: {details}"
+        super().__init__(message)
 
 # Factory function
 def get_data_retriever(use_cache: bool = True, update_registry: bool = True) -> NetSuiteDataRetriever:
