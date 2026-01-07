@@ -138,6 +138,7 @@ class ParsedQuery:
             "requires_disambiguation": self.requires_disambiguation,
             "disambiguation_message": self.disambiguation_message,
             "ambiguous_terms": self.ambiguous_terms,
+            "department_disambiguation_options": self.department_disambiguation_options,  # NEW
             "top_n": self.top_n,
             "group_by": self.group_by if isinstance(self.group_by, list) else ([self.group_by] if self.group_by else []),
             "confidence": self.confidence,
@@ -291,17 +292,35 @@ class QueryParser:
             notes.append(f"Comparison: {comparison_type.value}")
         
         # Extract departments (now aware of account-based terms and compound terms to exclude)
+        # IMPORTANT: Pass semantic_matched_ranges to prevent semantic filters from extracting
+        # individual words that are part of multi-word department names
         semantic_matched_ranges = semantic_result.get("matched_ranges", [])
         departments, dept_clarification = self._extract_departments(query, semantic_matched_ranges)
+        
+        # If multi-word departments were found, update semantic_matched_ranges to prevent
+        # semantic filters from extracting individual words from those ranges
+        if departments:
+            # Check if any department is a multi-word name (contains space but not ":")
+            for dept in departments:
+                if ' ' in dept and ':' not in dept:
+                    # This is a multi-word department - find it in the query and claim its range
+                    dept_lower = dept.lower()
+                    query_lower = query.lower()
+                    idx = query_lower.find(dept_lower)
+                    if idx >= 0:
+                        semantic_matched_ranges.append((idx, idx + len(dept)))
+                        logger.debug(f"Claimed range for multi-word department '{dept}': {idx}:{idx + len(dept)}")
         
         # Initialize department disambiguation options (will be populated if needed)
         department_disambiguation_options = {}
         
         # Merge semantic department filters (avoid duplicates, case-insensitive)
-        # BUT: If we have compound departments (containing ":"), don't merge individual parts
+        # BUT: If we have compound departments (containing ":") or multi-word departments,
+        # don't merge individual parts that are already included
         has_compound = any(':' in d for d in departments)
+        has_multi_word = any(' ' in d and ':' not in d for d in departments)  # Multi-word but not compound
         
-        if semantic_result.get("departments") and not has_compound:
+        if semantic_result.get("departments") and not has_compound and not has_multi_word:
             existing_lower = [d.lower() for d in departments]
             for dept in semantic_result["departments"]:
                 dept_lower = dept.lower()
@@ -328,20 +347,29 @@ class QueryParser:
                 if not is_synonym:
                     departments.append(dept)
                     existing_lower.append(dept_lower)
-        elif semantic_result.get("departments") and has_compound:
-            # We have compound departments - filter out individual parts that are already in compound names
+        elif semantic_result.get("departments") and (has_compound or has_multi_word):
+            # We have compound or multi-word departments - filter out individual parts that are already included
             existing_lower = [d.lower() for d in departments]
             for dept in semantic_result["departments"]:
-                # Check if this dept is part of any compound department name
-                is_part_of_compound = False
-                for compound_dept in departments:
-                    if ':' in compound_dept and dept.lower() in compound_dept.lower():
-                        is_part_of_compound = True
-                        break
+                # Check if this dept is part of any compound or multi-word department name
+                is_part_of_existing = False
+                for existing_dept in departments:
+                    # Check if semantic dept is a substring of existing dept (case-insensitive)
+                    if dept.lower() in existing_dept.lower():
+                        # But make sure it's not just a partial word match
+                        # e.g., "marketing" should match "Product Marketing" but "mark" shouldn't
+                        dept_words = set(dept.lower().split())
+                        existing_words = set(existing_dept.lower().split())
+                        # If all words in semantic dept are in existing dept, it's a subset
+                        if dept_words.issubset(existing_words) and len(existing_words) > len(dept_words):
+                            is_part_of_existing = True
+                            logger.debug(f"Skipping semantic department '{dept}' - already part of '{existing_dept}'")
+                            break
                 
-                if not is_part_of_compound and dept.lower() not in existing_lower:
+                if not is_part_of_existing and dept.lower() not in existing_lower:
                     departments.append(dept)
                     existing_lower.append(dept.lower())
+                    logger.debug(f"Added semantic department '{dept}' (not part of existing multi-word)")
         
         # NEW: Check departments against dynamic registry for disambiguation
         # This prevents consolidating departments that should be distinct (e.g., "Product Marketing" vs "Product Management")
@@ -429,8 +457,16 @@ class QueryParser:
         # NEW: Add dynamic clarification if needed (from department extraction)
         if dept_clarification and not requires_disambiguation:
             requires_disambiguation = True
-            disambiguation_message = dept_clarification["message"]
-            ambiguous_terms = [dept_clarification["term"]]
+            disambiguation_message = dept_clarification.get("message", "")
+            ambiguous_terms = [dept_clarification.get("term", "")]
+            # Store department disambiguation options
+            if "options" in dept_clarification:
+                department_disambiguation_options[dept_clarification.get("term", "")] = dept_clarification["options"]
+            logger.info(
+                f"Department clarification needed: '{dept_clarification.get('term', '')}' -> "
+                f"{len(dept_clarification.get('options', []))} options. "
+                f"Message: {disambiguation_message[:100]}..."
+            )
         
         # Extract subsidiaries from semantic filters
         subsidiaries = semantic_result.get("subsidiaries", [])
@@ -1011,16 +1047,24 @@ class QueryParser:
         # =========================================================================
         # This handles cases like "Product Marketing" which should be treated as a single
         # department name, not split into "Product" and "Marketing"
+        # IMPORTANT: This must run BEFORE individual word extraction to prevent splitting
+        logger.info("STEP 2.5: Checking for multi-word department names")
         if DYNAMIC_REGISTRY_AVAILABLE and self.dynamic_registry and not self.dynamic_registry.is_empty():
+            logger.info(f"Registry available: {not self.dynamic_registry.is_empty()}")
             try:
                 # Extract multi-word phrases that might be department names
                 # Look for patterns like "Product Marketing", "Human Resources", etc.
                 # Extract 2-4 word phrases that appear before "department", "dept", or end of query
                 # Use case-insensitive matching and capture the actual text from query
+                # Patterns to match multi-word department names before "department", "dept", etc.
                 multi_word_patterns = [
-                    r'\b([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept|expense|cost|spend|spending)',
+                    # Pattern 1: "for the X Y department" - most common pattern
                     r'for\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept)',
+                    # Pattern 2: "X Y department" at word boundary
+                    r'\b([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept|expense|cost|spend|spending)',
+                    # Pattern 3: "in the X Y department"
                     r'in\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept)',
+                    # Pattern 4: "of the X Y department"
                     r'of\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept)',
                 ]
                 

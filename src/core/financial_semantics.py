@@ -8,9 +8,16 @@ filters (Sales department).
 
 Key Concepts:
 - Account-based terms: Filter on account number prefixes (revenue, expenses, COGS)
-- Department-based terms: Filter on department names (Sales team, Marketing)
 - Ambiguous terms: Require user disambiguation (e.g., "sales" could be either)
 - Transaction type terms: Filter on transaction types (journals, invoices)
+- Compound account terms: Filter on BOTH account number AND name
+
+IMPORTANT: Department names are NOT in this dictionary.
+All department resolution is handled by the DynamicRegistry which
+discovers departments automatically from NetSuite data. This ensures:
+1. No manual maintenance when org structure changes
+2. Proper disambiguation for similar names (Product Marketing vs Product Management)
+3. Exact matching instead of substring matching
 """
 import re
 import logging
@@ -92,6 +99,20 @@ class SemanticTerm:
 # This is the central mapping of financial terms to their technical filters.
 # Each entry maps a natural language term to its proper interpretation.
 #
+# ARCHITECTURE:
+# - ACCOUNT terms: Filter on account NUMBER prefixes (revenue→"4", expenses→"5")
+# - COMPOUND_ACCOUNT terms: Filter on BOTH account number AND name
+# - TRANSACTION_TYPE terms: Filter on transaction types
+# - SUBSIDIARY terms: Filter on subsidiary names
+# - AMBIGUOUS terms: Require user disambiguation (e.g., "sales")
+#
+# IMPORTANT: Department names are NOT in this dictionary.
+# All department resolution is handled by the DynamicRegistry which
+# discovers departments automatically from NetSuite data. This ensures:
+# 1. No manual maintenance when org structure changes
+# 2. Proper disambiguation for similar names (Product Marketing vs Product Management)
+# 3. Exact matching instead of substring matching
+#
 # =============================================================================
 # CORE FINANCIAL SEMANTICS (STATIC)
 # =============================================================================
@@ -100,8 +121,8 @@ class SemanticTerm:
 # - Financial statement classifications
 # - Core accounting terms
 #
-# IMPORTANT: Department names, account names, and subsidiary names should NOT
-# be hardcoded here. They are dynamically discovered by the DynamicRegistry
+# IMPORTANT: Account names and subsidiary names should NOT be hardcoded here.
+# They are dynamically discovered by the DynamicRegistry
 # from actual NetSuite data. This ensures the system stays up-to-date when
 # organizational structures change.
 #
@@ -670,180 +691,23 @@ FINANCIAL_SEMANTICS: Dict[str, SemanticTerm] = {
     ),
     
     # -------------------------------------------------------------------------
-    # DEPARTMENT-BASED TERMS (DEPRECATED - Use DynamicRegistry)
+    # DEPARTMENT-BASED TERMS REMOVED
     # -------------------------------------------------------------------------
-    # NOTE: These static department mappings are deprecated and will be removed
-    # in a future version. The DynamicRegistry now handles department resolution
-    # automatically from NetSuite data.
+    # All department resolution is now handled by the DynamicRegistry which
+    # discovers departments automatically from NetSuite data. This ensures:
+    # 1. No manual maintenance when org structure changes
+    # 2. Proper disambiguation for similar names (Product Marketing vs Product Management)
+    # 3. Exact matching instead of substring matching
     #
-    # These are kept temporarily for backward compatibility but the DynamicRegistry
-    # takes precedence when available.
+    # The following department terms were removed:
+    # - "sales department", "sales team", "marketing", "marketing department", "mktg"
+    # - "engineering", "finance", "finance department", "accounting"
+    # - "hr", "human resources", "information technology", "customer success"
+    # - "product", "operations", "legal", "sdr", "sales development", "gcc"
+    # - DEPARTMENT-type entries for "r&d", "research and development", "g&a", "general and administrative"
+    #
+    # NOTE: ACCOUNT-type entries for "r&d", "g&a", etc. are KEPT (they filter on account number prefixes)
     # -------------------------------------------------------------------------
-    
-    "sales department": SemanticTerm(
-        term="sales department",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["Sales"],
-        description="Sales department costs",
-    ),
-    "sales team": SemanticTerm(
-        term="sales team",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["Sales"],
-        description="Sales team/department costs",
-    ),
-    "marketing": SemanticTerm(
-        term="marketing",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["Marketing"],
-        description="Marketing department costs",
-    ),
-    "marketing department": SemanticTerm(
-        term="marketing department",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["Marketing"],
-        description="Marketing department costs",
-    ),
-    "mktg": SemanticTerm(
-        term="mktg",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["Marketing"],
-        description="Marketing department costs",
-    ),
-    "engineering": SemanticTerm(
-        term="engineering",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["Engineering", "R&D"],
-        description="Engineering/R&D department costs",
-    ),
-    "r&d": SemanticTerm(
-        term="r&d",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["R&D", "Engineering"],
-        description="Research & Development department costs",
-    ),
-    "research and development": SemanticTerm(
-        term="research and development",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["R&D", "Engineering"],
-        description="Research & Development department costs",
-    ),
-    "g&a": SemanticTerm(
-        term="g&a",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["G&A"],
-        description="General & Administrative department costs",
-    ),
-    "general and administrative": SemanticTerm(
-        term="general and administrative",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["G&A"],
-        description="General & Administrative department costs",
-    ),
-    "finance": SemanticTerm(
-        term="finance",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["Finance"],
-        description="Finance department costs",
-    ),
-    "finance department": SemanticTerm(
-        term="finance department",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["Finance"],
-        description="Finance department costs",
-    ),
-    "accounting": SemanticTerm(
-        term="accounting",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["Finance", "Accounting"],
-        description="Accounting/Finance department costs",
-    ),
-    "hr": SemanticTerm(
-        term="hr",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["HR", "Human Resources"],
-        description="Human Resources department costs",
-    ),
-    "human resources": SemanticTerm(
-        term="human resources",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["HR", "Human Resources"],
-        description="Human Resources department costs",
-    ),
-    # NOTE: "it" removed - too ambiguous (matches pronoun "it" in queries)
-    # Use "IT" (uppercase) or "information technology" instead
-    # The regex pattern in query_parser.py handles uppercase "IT" specifically
-    "information technology": SemanticTerm(
-        term="information technology",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["IT", "Information Technology"],
-        description="IT department costs",
-    ),
-    "customer success": SemanticTerm(
-        term="customer success",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["Customer Success", "CS"],
-        description="Customer Success department costs",
-    ),
-    "product": SemanticTerm(
-        term="product",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["Product"],
-        description="Product department costs",
-    ),
-    "operations": SemanticTerm(
-        term="operations",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["Operations", "Ops"],
-        description="Operations department costs",
-    ),
-    "legal": SemanticTerm(
-        term="legal",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["Legal"],
-        description="Legal department costs",
-    ),
-    "sdr": SemanticTerm(
-        term="sdr",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["SDR", "Sales Development"],
-        description="Sales Development Representative team costs",
-    ),
-    "sales development": SemanticTerm(
-        term="sales development",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["SDR", "Sales Development"],
-        description="Sales Development team costs",
-    ),
-    "gcc": SemanticTerm(
-        term="gcc",
-        category=SemanticCategory.DEPARTMENT,
-        filter_type=FilterType.CONTAINS,
-        filter_values=["GCC", "Customer Centric Engineering"],
-        description="GCC/Customer Centric Engineering department costs",
-    ),
     
     # -------------------------------------------------------------------------
     # AMBIGUOUS TERMS (require user disambiguation)

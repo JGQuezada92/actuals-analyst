@@ -321,6 +321,9 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         """
         from src.core.financial_semantics import SemanticCategory
         
+        resolved_terms = set()
+        unresolved_terms = []
+        
         for term, choice_index in choices.items():
             # Check if this is a department disambiguation from registry
             if term in parsed_query.department_disambiguation_options:
@@ -334,16 +337,26 @@ as "associated with" not "causes" unless there's clear causal reasoning.
                         parsed_query.departments.remove(term)
                     parsed_query.departments.append(selected_dept)
                     logger.info(f"Resolved department '{term}' to '{selected_dept}' (choice {choice_index})")
+                    # Remove from disambiguation options after successful resolution
+                    parsed_query.department_disambiguation_options.pop(term, None)
+                    resolved_terms.add(term)
                 else:
-                    logger.warning(f"Invalid choice index {choice_index} for term '{term}' (options: {len(options)})")
+                    logger.warning(
+                        f"Invalid choice index {choice_index} for term '{term}' "
+                        f"(valid range: 1-{len(options)}). Keeping term unresolved."
+                    )
+                    unresolved_terms.append(term)
                 continue
             
             # Handle semantic term disambiguation (existing logic)
             semantic_term = get_semantic_term(term)
             if semantic_term and semantic_term.disambiguation_required:
-                resolved = apply_disambiguation_choice(semantic_term, choice_index)
+                # Convert 1-based user choice to 0-based index
+                user_choice = choice_index - 1 if choice_index > 0 else choice_index
+                resolved = apply_disambiguation_choice(semantic_term, user_choice)
                 if resolved:
                     logger.debug(f"Resolved '{term}' to {resolved.category.value}")
+                    resolved_terms.add(term)
                     
                     if resolved.category == SemanticCategory.ACCOUNT:
                         parsed_query.account_type_filter = {
@@ -352,12 +365,35 @@ as "associated with" not "causes" unless there's clear causal reasoning.
                         }
                     elif resolved.category == SemanticCategory.DEPARTMENT:
                         parsed_query.departments.extend(resolved.filter_values)
+                else:
+                    unresolved_terms.append(term)
+                    logger.warning(f"Failed to resolve semantic term '{term}' with choice {choice_index}")
         
-        # Clear disambiguation flags
-        parsed_query.requires_disambiguation = False
-        parsed_query.disambiguation_message = None
-        parsed_query.ambiguous_terms = []
-        parsed_query.department_disambiguation_options = {}
+        # Only clear disambiguation flags if all terms were resolved
+        # Check if there are any remaining ambiguous terms or department options
+        remaining_ambiguous = [
+            t for t in parsed_query.ambiguous_terms 
+            if t not in resolved_terms
+        ]
+        remaining_dept_options = parsed_query.department_disambiguation_options
+        
+        if not remaining_ambiguous and not remaining_dept_options:
+            # All disambiguations resolved - clear flags
+            parsed_query.requires_disambiguation = False
+            parsed_query.disambiguation_message = None
+            parsed_query.ambiguous_terms = []
+            parsed_query.department_disambiguation_options = {}
+        elif unresolved_terms:
+            # Some terms couldn't be resolved - keep disambiguation flags but update message
+            logger.warning(
+                f"Some terms could not be resolved: {unresolved_terms}. "
+                f"Keeping disambiguation flags active."
+            )
+            # Update ambiguous terms list to only include unresolved ones
+            parsed_query.ambiguous_terms = [
+                t for t in parsed_query.ambiguous_terms 
+                if t not in resolved_terms
+            ]
         
         return parsed_query
     

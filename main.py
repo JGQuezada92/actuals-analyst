@@ -86,6 +86,10 @@ def cmd_analyze(args):
             "evaluation_summary": response.evaluation_summary,
             "metadata": response.metadata,
             "trace_id": response.metadata.get("trace_id") if hasattr(response, 'metadata') else None,
+            # Include disambiguation fields for UI
+            "requires_clarification": response.requires_clarification if hasattr(response, 'requires_clarification') else False,
+            "clarification_message": response.clarification_message if hasattr(response, 'clarification_message') else None,
+            "ambiguous_terms": response.ambiguous_terms if hasattr(response, 'ambiguous_terms') else [],
         }
         print("```json")
         print(json.dumps(result, indent=2, default=str))
