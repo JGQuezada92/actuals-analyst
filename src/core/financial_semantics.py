@@ -438,6 +438,175 @@ FINANCIAL_SEMANTICS: Dict[str, SemanticTerm] = {
         description="All expense accounts (account numbers starting with 5, 6, 7, or 8)",
     ),
     
+    # -------------------------------------------------------------------------
+    # EXPENSE CATEGORY TERMS (filter on account NAME contains)
+    # These terms filter accounts by name, not by account number prefix
+    # -------------------------------------------------------------------------
+    
+    # Payroll & Compensation
+    "salary": SemanticTerm(
+        term="salary",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Salary", "Salaries"],
+        description="Salary expense accounts (account names containing 'Salary')",
+    ),
+    "salaries": SemanticTerm(
+        term="salaries",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Salary", "Salaries"],
+        description="Salary expense accounts (account names containing 'Salary')",
+    ),
+    "payroll": SemanticTerm(
+        term="payroll",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Payroll"],
+        description="Payroll expense accounts (account names containing 'Payroll')",
+    ),
+    "compensation": SemanticTerm(
+        term="compensation",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Compensation"],
+        description="Compensation expense accounts (account names containing 'Compensation')",
+    ),
+    "benefits": SemanticTerm(
+        term="benefits",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Benefits", "Benefit"],
+        description="Employee benefits expense accounts (account names containing 'Benefits')",
+    ),
+    "employee benefits": SemanticTerm(
+        term="employee benefits",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Benefits", "Benefit"],
+        description="Employee benefits expense accounts (account names containing 'Benefits')",
+    ),
+    
+    # Facilities & Operations
+    "rent": SemanticTerm(
+        term="rent",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Rent", "Lease"],
+        description="Rent/lease expense accounts (account names containing 'Rent' or 'Lease')",
+    ),
+    "rent expense": SemanticTerm(
+        term="rent expense",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Rent", "Lease"],
+        description="Rent/lease expense accounts (account names containing 'Rent' or 'Lease')",
+    ),
+    "utilities": SemanticTerm(
+        term="utilities",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Utilities", "Utility"],
+        description="Utilities expense accounts (account names containing 'Utilities')",
+    ),
+    "utilities expense": SemanticTerm(
+        term="utilities expense",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Utilities", "Utility"],
+        description="Utilities expense accounts (account names containing 'Utilities')",
+    ),
+    
+    # Technology & Software
+    "software": SemanticTerm(
+        term="software",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Software", "SaaS", "Subscription"],
+        description="Software expense accounts (account names containing 'Software', 'SaaS', or 'Subscription')",
+    ),
+    "software expense": SemanticTerm(
+        term="software expense",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Software", "SaaS", "Subscription"],
+        description="Software expense accounts (account names containing 'Software', 'SaaS', or 'Subscription')",
+    ),
+    "saas": SemanticTerm(
+        term="saas",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["SaaS", "Software", "Subscription"],
+        description="SaaS/software subscription expense accounts",
+    ),
+    "subscriptions": SemanticTerm(
+        term="subscriptions",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Subscription", "SaaS", "Software"],
+        description="Software subscription expense accounts",
+    ),
+    
+    # Travel & Entertainment
+    "travel": SemanticTerm(
+        term="travel",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Travel", "T&E"],
+        description="Travel expense accounts (account names containing 'Travel' or 'T&E')",
+    ),
+    "travel expense": SemanticTerm(
+        term="travel expense",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Travel", "T&E"],
+        description="Travel expense accounts (account names containing 'Travel' or 'T&E')",
+    ),
+    "travel and entertainment": SemanticTerm(
+        term="travel and entertainment",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Travel", "T&E", "Entertainment"],
+        description="Travel and entertainment expense accounts",
+    ),
+    "t&e": SemanticTerm(
+        term="t&e",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["T&E", "Travel", "Entertainment"],
+        description="Travel and entertainment expense accounts",
+    ),
+    
+    # Insurance & Professional Services
+    "insurance": SemanticTerm(
+        term="insurance",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Insurance"],
+        description="Insurance expense accounts (account names containing 'Insurance')",
+    ),
+    "professional services": SemanticTerm(
+        term="professional services",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Professional Services", "Consulting", "Legal"],
+        description="Professional services expense accounts (account names containing 'Professional Services', 'Consulting', or 'Legal')",
+    ),
+    "consulting": SemanticTerm(
+        term="consulting",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Consulting", "Professional Services"],
+        description="Consulting expense accounts",
+    ),
+    "legal": SemanticTerm(
+        term="legal",
+        category=SemanticCategory.ACCOUNT_NAME,
+        filter_type=FilterType.CONTAINS,
+        filter_values=["Legal", "Professional Services"],
+        description="Legal expense accounts",
+    ),
+    
     # Balance Sheet - Assets (1xxx)
     "assets": SemanticTerm(
         term="assets",

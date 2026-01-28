@@ -203,13 +203,47 @@ export class AgentBridge extends EventEmitter {
   }
 
   private extractFinalResult(stdout: string): any {
-    // Look for JSON in markdown code block
-    const jsonMatch = stdout.match(/```json\n([\s\S]*?)\n```/);
+    // Look for JSON in markdown code block (more flexible regex)
+    // Handles cases like: ```json\n{...}\n``` or ```json\n{...}\n```\n
+    const jsonMatch = stdout.match(/```json\s*\n([\s\S]*?)\n\s*```/);
     if (jsonMatch) {
-      return JSON.parse(jsonMatch[1]);
+      try {
+        return JSON.parse(jsonMatch[1].trim());
+      } catch (e) {
+        console.warn(`[Agent] Failed to parse JSON from code block: ${e}`);
+        // Fall through to try other methods
+      }
     }
 
-    // Look for standalone JSON at end
+    // Look for JSON object starting with { and ending with }
+    // Try to find the largest valid JSON object
+    const jsonStart = stdout.lastIndexOf('{');
+    if (jsonStart >= 0) {
+      // Find matching closing brace
+      let braceCount = 0;
+      let jsonEnd = -1;
+      for (let i = jsonStart; i < stdout.length; i++) {
+        if (stdout[i] === '{') braceCount++;
+        if (stdout[i] === '}') {
+          braceCount--;
+          if (braceCount === 0) {
+            jsonEnd = i + 1;
+            break;
+          }
+        }
+      }
+      
+      if (jsonEnd > jsonStart) {
+        try {
+          const jsonStr = stdout.substring(jsonStart, jsonEnd);
+          return JSON.parse(jsonStr);
+        } catch (e) {
+          console.warn(`[Agent] Failed to parse JSON from braces: ${e}`);
+        }
+      }
+    }
+
+    // Look for standalone JSON at end (single line)
     const lines = stdout.trim().split('\n');
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i].trim();

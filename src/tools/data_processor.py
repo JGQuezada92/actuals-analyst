@@ -709,6 +709,8 @@ class DataProcessor:
         custom_filters: List[Callable[[Dict], bool]] = None,
         account_type_filter: Dict[str, Any] = None,
         transaction_type_filter: List[str] = None,
+        exclude_departments: List[str] = None,
+        exclude_accounts: List[str] = None,
     ) -> FilterResult:
         """
         Apply multiple filters to data.
@@ -722,6 +724,8 @@ class DataProcessor:
             account_type_filter: Semantic account type filter (NEW)
                 Example: {"filter_type": "prefix", "values": ["4"]}
             transaction_type_filter: List of transaction types to include (NEW)
+            exclude_departments: Department names to exclude (NEW)
+            exclude_accounts: Account patterns to exclude (NEW)
         """
         result = data
         all_filters = []
@@ -797,6 +801,64 @@ class DataProcessor:
                         acct_filtered.append(row)
                 result = acct_filtered
                 all_filters.append(f"account in {accounts}")
+        
+        # NEW: Apply exclusion filters (after inclusion filters)
+        # Exclude departments
+        if exclude_departments:
+            dept_field = self.find_field(result, "department")
+            if dept_field:
+                context = get_data_context()
+                dept_filtered = []
+                for row in result:
+                    row_dept_raw = str(row.get(dept_field, "")).strip()
+                    if not row_dept_raw:
+                        # Keep rows with no department if excluding
+                        dept_filtered.append(row)
+                        continue
+                    
+                    row_dept_lower = row_dept_raw.lower()
+                    
+                    # Check if this row matches any excluded department
+                    excluded = False
+                    for exclude_dept in exclude_departments:
+                        exclude_dept_info = context.parse_department(exclude_dept)
+                        exclude_dept_lower = exclude_dept_info.department_name.lower().strip()
+                        exclude_full_lower = exclude_dept.lower().strip()
+                        
+                        # If user provided full hierarchical path, match exactly
+                        if " : " in exclude_dept:
+                            if row_dept_lower == exclude_full_lower:
+                                excluded = True
+                                break
+                        else:
+                            # User provided just department name - extract department part and match exactly
+                            row_dept_info = context.parse_department(row_dept_raw)
+                            row_dept_name_lower = row_dept_info.department_name.lower().strip()
+                            
+                            # Exact match on department name part
+                            if row_dept_name_lower == exclude_dept_lower:
+                                excluded = True
+                                break
+                    
+                    if not excluded:
+                        dept_filtered.append(row)
+                
+                result = dept_filtered
+                all_filters.append(f"exclude department in {exclude_departments}")
+        
+        # Exclude accounts
+        if exclude_accounts:
+            acct_field = self.find_field(result, "account") or self.find_field(result, "account_number")
+            if acct_field:
+                acct_filtered = []
+                for row in result:
+                    row_acct = str(row.get(acct_field, "")).lower()
+                    # Exclude if account matches any excluded pattern
+                    excluded = any(exclude_acct.lower() in row_acct for exclude_acct in exclude_accounts)
+                    if not excluded:
+                        acct_filtered.append(row)
+                result = acct_filtered
+                all_filters.append(f"exclude account in {exclude_accounts}")
         
         # Apply custom filters
         if custom_filters:

@@ -60,15 +60,24 @@ class RegistryEntry:
     row_count: int = 0            # How many rows have this value (for ranking)
     last_seen: Optional[datetime] = None
     
+    @staticmethod
+    def _tokenize_words(text: str) -> set:
+        """Tokenize text into words, stripping punctuation."""
+        import re
+        # Remove punctuation and split into words
+        cleaned = re.sub(r'[,&()\-/]', ' ', text)
+        return {w.strip() for w in cleaned.split() if w.strip()}
+    
     def matches(self, query_term: str) -> Tuple[bool, float]:
         """
         Check if this entry matches a query term.
         
         Returns:
             Tuple of (is_match, confidence_score)
-            - confidence 1.0 = exact match
-            - confidence 0.8-0.99 = alias match
-            - confidence 0.5-0.79 = partial/contains match
+            - confidence 1.0 = exact match on canonical or child part
+            - confidence 0.95 = exact match on an alias
+            - confidence 0.85-0.94 = all query words match child part
+            - confidence 0.5-0.84 = partial/contains match
             - confidence < 0.5 = weak match
         """
         query_lower = query_term.lower().strip()
@@ -82,23 +91,86 @@ class RegistryEntry:
         if query_lower in self.aliases:
             return True, 0.95
         
+        # For hierarchical names like "R&D (Parent) : Security, Privacy & Compliance",
+        # check if query matches the CHILD part (highest priority for department queries)
+        if ' : ' in canonical_lower:
+            parts = canonical_lower.split(' : ')
+            child_part = parts[-1].strip()  # Get the last part (most specific)
+            
+            # Exact match on child part -> very high confidence
+            if query_lower == child_part:
+                return True, 1.0
+            
+            # Tokenize words properly (strip punctuation)
+            query_words = self._tokenize_words(query_lower)
+            child_words = self._tokenize_words(child_part)
+            
+            # All query words are in child part -> high confidence
+            if query_words and query_words.issubset(child_words):
+                # Higher score if query covers most of child
+                coverage = len(query_words) / len(child_words) if child_words else 0
+                return True, max(0.85, min(0.94, 0.85 + coverage * 0.09))
+            
+            # Single-word query: check if it matches the FIRST word of child part
+            # This handles "security" matching "Security, Privacy & Compliance"
+            if len(query_words) == 1:
+                query_word = list(query_words)[0]
+                child_words_list = list(child_words)
+                
+                # Get the first meaningful word in child part
+                if child_words_list:
+                    first_child_word = child_words_list[0] if child_words_list else ""
+                    
+                    # Exact match on first word of child -> high confidence
+                    if query_word == first_child_word:
+                        return True, 0.90
+                    
+                    # Query word is in child words (not first) -> medium-high confidence
+                    if query_word in child_words:
+                        return True, 0.80
+        
+        # Multi-word query: require ALL words to be present (word-boundary matching)
+        query_words = self._tokenize_words(query_lower)
+        if len(query_words) > 1:
+            canonical_words = self._tokenize_words(canonical_lower)
+            
+            # Check how many query words are in canonical
+            matched_words = sum(1 for qw in query_words if qw in canonical_words)
+            
+            # All words must match for multi-word queries
+            if matched_words == len(query_words):
+                coverage = len(query_words) / len(canonical_words) if canonical_words else 0
+                return True, max(0.6, min(0.84, 0.5 + coverage * 0.34))
+            
+            # Partial word match - very low confidence (likely wrong match)
+            if matched_words > 0:
+                return True, 0.3  # Low confidence - needs clarification
+            
+            return False, 0.0
+        
+        # Single-word query: use substring matching but with adjusted confidence
         # Query is contained in canonical name
         if query_lower in canonical_lower:
-            # Score based on coverage ratio
+            # Score based on coverage ratio - boost for longer matches
             coverage = len(query_lower) / len(canonical_lower)
-            return True, max(0.5, min(0.85, coverage + 0.3))
+            # Boost confidence if query is a significant word (>= 5 chars)
+            if len(query_lower) >= 5:
+                return True, max(0.6, min(0.80, coverage + 0.35))
+            return True, max(0.5, min(0.70, coverage + 0.2))
         
         # Canonical is contained in query (less confident)
         if canonical_lower in query_lower:
-            return True, 0.4
+            return True, 0.35
         
-        # Check aliases for partial matches
+        # Check aliases for partial matches (lower confidence)
         for alias in self.aliases:
+            if query_lower == alias:
+                return True, 0.9  # Exact alias match
             if query_lower in alias:
                 coverage = len(query_lower) / len(alias)
-                return True, max(0.4, min(0.75, coverage + 0.2))
+                return True, max(0.35, min(0.6, coverage + 0.1))
             if alias in query_lower:
-                return True, 0.35
+                return True, 0.3
         
         return False, 0.0
     
@@ -303,7 +375,7 @@ class DynamicRegistry:
         self,
         term: str,
         entity_type: EntityType = None,
-        min_confidence: float = 0.3,
+        min_confidence: float = 0.5,
         max_results: int = 10,
     ) -> RegistryMatch:
         """
@@ -312,16 +384,17 @@ class DynamicRegistry:
         Args:
             term: The search term (e.g., "GPS", "marketing", "53100")
             entity_type: Limit search to this entity type (optional)
-            min_confidence: Minimum confidence score to include (0.0-1.0)
+            min_confidence: Minimum confidence score to include (0.0-1.0). Default 0.5 (raised from 0.3)
             max_results: Maximum number of matches to return
         
         Returns:
             RegistryMatch with matches and clarification info
         """
         term_lower = term.lower().strip()
-        matches: List[Tuple[RegistryEntry, float]] = []
+        exact_matches: List[Tuple[RegistryEntry, float]] = []
+        partial_matches: List[Tuple[RegistryEntry, float]] = []
         
-        # Step 1: Check inverted index for exact/alias matches
+        # Step 1: Check inverted index for exact/alias matches FIRST (highest priority)
         if term_lower in self._index:
             for etype, canonical in self._index[term_lower]:
                 if entity_type and etype != entity_type:
@@ -329,26 +402,68 @@ class DynamicRegistry:
                 entry = self._registry[etype].get(canonical)
                 if entry:
                     _, confidence = entry.matches(term_lower)
-                    matches.append((entry, confidence))
+                    # Prioritize exact matches (confidence 1.0 or 0.95)
+                    if confidence >= 0.95:
+                        exact_matches.append((entry, confidence))
+                    elif confidence >= min_confidence:
+                        partial_matches.append((entry, confidence))
         
-        # Step 2: If no exact matches, do fuzzy search across all entries
-        if not matches:
+        # Step 2: If we have exact matches, return immediately (no need for fuzzy search)
+        if exact_matches:
+            # Sort exact matches by confidence, then row_count
+            exact_matches.sort(key=lambda x: (x[1], x[0].row_count), reverse=True)
+            matched_entries = [m[0] for m in exact_matches]
+            best_confidence = exact_matches[0][1]
+            
+            # Single exact match -> no clarification needed
+            if len(exact_matches) == 1:
+                return RegistryMatch(
+                    term=term,
+                    entity_type=matched_entries[0].entity_type,
+                    matches=matched_entries,
+                    confidence=best_confidence,
+                    needs_clarification=False,
+                )
+            
+            # Multiple exact matches -> check if they're the same entity
+            unique_canonicals = set(e.canonical_name for e in matched_entries)
+            if len(unique_canonicals) == 1:
+                return RegistryMatch(
+                    term=term,
+                    entity_type=matched_entries[0].entity_type,
+                    matches=[matched_entries[0]],
+                    confidence=best_confidence,
+                    needs_clarification=False,
+                )
+            
+            # Multiple distinct exact matches -> needs clarification
+            return RegistryMatch(
+                term=term,
+                entity_type=entity_type or matched_entries[0].entity_type,
+                matches=matched_entries[:max_results],
+                confidence=best_confidence,
+                needs_clarification=True,
+                clarification_options=[e.canonical_name for e in matched_entries[:max_results]],
+            )
+        
+        # Step 3: If no exact matches, do fuzzy search across all entries
+        if not partial_matches:
             types_to_search = [entity_type] if entity_type else list(EntityType)
             
             for etype in types_to_search:
                 for entry in self._registry.get(etype, {}).values():
                     is_match, confidence = entry.matches(term_lower)
                     if is_match and confidence >= min_confidence:
-                        matches.append((entry, confidence))
+                        partial_matches.append((entry, confidence))
         
-        # Step 3: Sort by confidence (descending), then by row_count (descending)
-        matches.sort(key=lambda x: (x[1], x[0].row_count), reverse=True)
+        # Step 4: Sort by confidence (descending), then by row_count (descending)
+        partial_matches.sort(key=lambda x: (x[1], x[0].row_count), reverse=True)
         
-        # Step 4: Limit results
-        matches = matches[:max_results]
+        # Step 5: Limit results
+        partial_matches = partial_matches[:max_results]
         
-        # Step 5: Determine if clarification is needed
-        if not matches:
+        # Step 6: Determine if clarification is needed
+        if not partial_matches:
             return RegistryMatch(
                 term=term,
                 entity_type=entity_type,
@@ -357,11 +472,51 @@ class DynamicRegistry:
                 needs_clarification=False,
             )
         
-        best_confidence = matches[0][1]
-        matched_entries = [m[0] for m in matches]
+        best_confidence = partial_matches[0][1]
+        matched_entries = [m[0] for m in partial_matches]
+        
+        # NEW: Child-part priority matching for hierarchical departments
+        # When searching for "Product Management", prefer "R&D (Parent) : Product Management"
+        # over "Sales (Parent) : Sales NA : Enterprise Sales" (which might match on unrelated words)
+        if len(partial_matches) > 1 and entity_type == EntityType.DEPARTMENT:
+            child_exact_matches = []
+            term_words = set(term_lower.split())
+            
+            for entry, confidence in partial_matches:
+                canonical = entry.canonical_name.lower()
+                if ' : ' in canonical:
+                    # Get the child part (last segment after ":")
+                    child_part = canonical.split(' : ')[-1].strip()
+                    child_words = set(child_part.split())
+                    
+                    # Check if query exactly matches child part
+                    if term_lower == child_part:
+                        child_exact_matches.append((entry, 1.0))
+                        logger.debug(f"Child-part exact match: '{term}' -> '{entry.canonical_name}'")
+                    # Check if all query words are in child part (for multi-word queries)
+                    elif term_words and term_words.issubset(child_words) and len(term_words) > 1:
+                        # Calculate match quality based on word coverage
+                        coverage = len(term_words) / len(child_words)
+                        adjusted_confidence = max(confidence, 0.9 + coverage * 0.05)
+                        child_exact_matches.append((entry, adjusted_confidence))
+                        logger.debug(f"Child-part word match: '{term}' -> '{entry.canonical_name}' (conf={adjusted_confidence:.2f})")
+            
+            # If we found child-part matches, use those exclusively
+            if child_exact_matches:
+                child_exact_matches.sort(key=lambda x: (x[1], x[0].row_count), reverse=True)
+                best_match = child_exact_matches[0]
+                logger.info(f"Using child-part priority match: '{term}' -> '{best_match[0].canonical_name}'")
+                
+                return RegistryMatch(
+                    term=term,
+                    entity_type=best_match[0].entity_type,
+                    matches=[best_match[0]],
+                    confidence=best_match[1],
+                    needs_clarification=False,
+                )
         
         # Single high-confidence match -> no clarification needed
-        if len(matches) == 1 and best_confidence >= 0.85:
+        if len(partial_matches) == 1 and best_confidence >= 0.85:
             return RegistryMatch(
                 term=term,
                 entity_type=matched_entries[0].entity_type,

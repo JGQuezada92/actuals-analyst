@@ -91,6 +91,13 @@ class ParsedQuery:
     subsidiaries: List[str] = field(default_factory=list)
     is_consolidated: bool = False  # True for consolidated (all subsidiaries) queries
     
+    # Exclusion filters (NEW)
+    exclude_departments: List[str] = field(default_factory=list)
+    exclude_accounts: List[str] = field(default_factory=list)
+    
+    # Comparison flags (NEW)
+    is_department_comparison: bool = False  # True if comparing multiple departments
+    
     # Semantic filters (NEW - from financial_semantics module)
     account_type_filter: Optional[Dict[str, Any]] = None  # {"filter_type": "prefix", "values": ["4"]}
     account_name_filter: Optional[Dict[str, Any]] = None  # {"filter_type": "contains", "values": ["Sales & Marketing"]}
@@ -139,6 +146,8 @@ class ParsedQuery:
             "disambiguation_message": self.disambiguation_message,
             "ambiguous_terms": self.ambiguous_terms,
             "department_disambiguation_options": self.department_disambiguation_options,  # NEW
+            "exclude_departments": self.exclude_departments,  # NEW
+            "exclude_accounts": self.exclude_accounts,  # NEW
             "top_n": self.top_n,
             "group_by": self.group_by if isinstance(self.group_by, list) else ([self.group_by] if self.group_by else []),
             "confidence": self.confidence,
@@ -207,7 +216,7 @@ class QueryParser:
         "last_month": r"\b(last month|prior month|previous month)\b",
         "current_quarter": r"\b(this quarter|current quarter|Q[1-4]\s*(?:FY)?\d{0,4})\b",
         "last_quarter": r"\b(last quarter|prior quarter|previous quarter)\b",
-        "current_year": r"\b(this year|current year|current fiscal year|this fiscal year|FY\s*\d{2,4})\b",
+        "current_year": r"\b(this year|current year|current fiscal year|this fiscal year|current\s+FY|this\s+FY|FY\s*\d{2,4})\b",
         "last_year": r"\b(last year|prior year|previous year)\b",
         # Trailing period patterns (TTM, trailing N months)
         "ttm": r"\b(TTM|T12M|trailing\s*12\s*months?|trailing\s*twelve\s*months?|last\s*12\s*months?)\b",
@@ -297,6 +306,21 @@ class QueryParser:
         semantic_matched_ranges = semantic_result.get("matched_ranges", [])
         departments, dept_clarification = self._extract_departments(query, semantic_matched_ranges)
         
+        # NEW: Detect department comparison queries (e.g., "Finance vs HR", "compare Marketing and Sales")
+        # Check if we have multiple departments and comparison keywords
+        is_department_comparison = self._is_department_comparison_query(query_lower, departments)
+        if is_department_comparison and len(departments) >= 2:
+            # Set comparison intent if not already set
+            if not comparison_type:
+                comparison_type = ComparisonType.CUSTOM
+            if intent != QueryIntent.COMPARISON:
+                intent = QueryIntent.COMPARISON
+                notes.append("Detected department comparison query")
+        # IMPORTANT: Pass semantic_matched_ranges to prevent semantic filters from extracting
+        # individual words that are part of multi-word department names
+        semantic_matched_ranges = semantic_result.get("matched_ranges", [])
+        departments, dept_clarification = self._extract_departments(query, semantic_matched_ranges)
+        
         # If multi-word departments were found, update semantic_matched_ranges to prevent
         # semantic filters from extracting individual words from those ranges
         if departments:
@@ -381,7 +405,7 @@ class QueryParser:
                 
                 for dept in departments:
                     # Check if this department term matches multiple actual departments
-                    match = registry.lookup(dept, entity_type=EntityType.DEPARTMENT, min_confidence=0.3)
+                    match = registry.lookup(dept, entity_type=EntityType.DEPARTMENT, min_confidence=0.5)
                     
                     if match.needs_clarification and len(match.clarification_options) > 1:
                         # Multiple matches found - needs disambiguation
@@ -435,6 +459,13 @@ class QueryParser:
         accounts = self._extract_accounts(query)
         if accounts:
             notes.append(f"Accounts: {accounts}")
+        
+        # NEW: Extract exclusion terms
+        exclude_departments, exclude_accounts = self._extract_exclusion_terms(query, departments)
+        if exclude_departments:
+            notes.append(f"Exclude departments: {exclude_departments}")
+        if exclude_accounts:
+            notes.append(f"Exclude accounts: {exclude_accounts}")
         
         # Extract top N
         top_n = self._extract_top_n(query_lower)
@@ -521,6 +552,9 @@ class QueryParser:
             disambiguation_message=disambiguation_message,
             ambiguous_terms=ambiguous_terms,
             department_disambiguation_options=department_disambiguation_options,
+            exclude_departments=exclude_departments,  # NEW
+            exclude_accounts=exclude_accounts,  # NEW
+            is_department_comparison=is_department_comparison,  # NEW
             semantic_terms=semantic_terms,
             top_n=top_n,
             group_by=group_by,
@@ -528,6 +562,61 @@ class QueryParser:
             used_llm_fallback=used_llm,
             parsing_notes=notes,
         )
+    
+    def _extract_account_prefix_patterns(self, query: str) -> List[str]:
+        """
+        Extract account prefix patterns from natural language queries.
+        
+        Handles patterns like:
+        - "53 accounts" → ["53"]
+        - "5xxx accounts" → ["5"]
+        - "accounts starting with 52" → ["52"]
+        - "all 4-series accounts" → ["4"]
+        
+        Returns:
+            List of account number prefixes
+        """
+        prefixes = []
+        query_lower = query.lower()
+        
+        # Pattern 1: "53 accounts", "52 accounts", etc.
+        # Matches: number (1-3 digits) followed by "accounts" or "account"
+        pattern1 = r"\b(\d{1,3})\s+accounts?\b"
+        matches = re.findall(pattern1, query_lower)
+        for match in matches:
+            if match not in prefixes:
+                prefixes.append(match)
+        
+        # Pattern 2: "5xxx accounts", "4xxx accounts" (with wildcard)
+        # Matches: number followed by "xxx" and "accounts"
+        pattern2 = r"\b(\d{1,2})xxx\s+accounts?\b"
+        matches = re.findall(pattern2, query_lower)
+        for match in matches:
+            if match not in prefixes:
+                prefixes.append(match)
+        
+        # Pattern 3: "accounts starting with 52", "accounts beginning with 4"
+        pattern3 = r"accounts?\s+(?:starting|beginning)\s+with\s+(\d{1,3})\b"
+        matches = re.findall(pattern3, query_lower)
+        for match in matches:
+            if match not in prefixes:
+                prefixes.append(match)
+        
+        # Pattern 4: "all 4-series accounts", "all 5-series accounts"
+        pattern4 = r"all\s+(\d{1,2})[-\s]?series\s+accounts?\b"
+        matches = re.findall(pattern4, query_lower)
+        for match in matches:
+            if match not in prefixes:
+                prefixes.append(match)
+        
+        # Pattern 5: "account 53", "acct 52" (shorter form)
+        pattern5 = r"\b(?:account|acct)\.?\s+(\d{1,3})\b"
+        matches = re.findall(pattern5, query_lower)
+        for match in matches:
+            if match not in prefixes:
+                prefixes.append(match)
+        
+        return prefixes
     
     def _extract_semantic_filters(self, query: str) -> Dict[str, Any]:
         """
@@ -557,6 +646,13 @@ class QueryParser:
             "matched_ranges": [],  # Character ranges claimed by compound terms
         }
         
+        # NEW: Extract account prefix patterns from natural language FIRST
+        # This handles queries like "53 accounts", "5xxx accounts", etc.
+        account_prefix_patterns = self._extract_account_prefix_patterns(query)
+        if account_prefix_patterns:
+            logger.debug(f"Extracted account prefix patterns: {account_prefix_patterns}")
+            # These will be merged with semantic term prefixes below
+        
         # Resolve all financial terms in the query (with ranges for overlap detection)
         resolved_terms, matched_ranges = resolve_financial_terms_with_ranges(query)
         result["matched_ranges"] = matched_ranges
@@ -582,6 +678,8 @@ class QueryParser:
         
         # Process each resolved term
         account_prefixes = []
+        # NEW: Start with account prefix patterns extracted from natural language
+        account_prefixes.extend(account_prefix_patterns)
         account_name_values = []
         transaction_types = []
         subsidiaries = []
@@ -802,6 +900,22 @@ class QueryParser:
                 year += 2000
             return self.fiscal_calendar.get_fiscal_year_range(year)
         
+        # NEW: Try to parse calendar year (e.g., "2024 expenses", "2024 calendar year")
+        # Only if not already matched as fiscal year
+        calendar_year_match = re.search(r"\b(\d{4})\s+(?:expenses?|revenue|spending|costs?)(?!\s+fiscal)\b", query, re.IGNORECASE)
+        if calendar_year_match:
+            year = int(calendar_year_match.group(1))
+            from datetime import date
+            from src.core.fiscal_calendar import FiscalPeriod
+            calendar_period = FiscalPeriod(
+                start_date=date(year, 1, 1),
+                end_date=date(year, 12, 31),
+                period_name=f"Calendar Year {year}",
+                fiscal_year=year,
+            )
+            logger.info(f"Detected calendar year from query: {calendar_period.period_name}")
+            return calendar_period
+        
         # Try to parse "YYYY fiscal year" format (e.g., "2026 fiscal year", "2025 fiscal year")
         # Pattern: 4-digit year followed by "fiscal year"
         fy_year_match = re.search(r"\b(\d{4})\s+fiscal\s+year\b", query, re.IGNORECASE)
@@ -824,8 +938,40 @@ class QueryParser:
                 elif period_type == "current_quarter":
                     return self.fiscal_calendar.get_current_quarter()
                 elif period_type == "current_year":
+                    # NEW: Check if query explicitly mentions "calendar year"
+                    if re.search(r'\bcalendar\s+year\b', query, re.IGNORECASE):
+                        # User explicitly wants calendar year
+                        from datetime import date
+                        current_year = date.today().year
+                        from src.core.fiscal_calendar import FiscalPeriod
+                        calendar_period = FiscalPeriod(
+                            start_date=date(current_year, 1, 1),
+                            end_date=date(current_year, 12, 31),
+                            period_name=f"Calendar Year {current_year}",
+                            fiscal_year=current_year,
+                        )
+                        logger.info(f"Detected calendar year request: {calendar_period.period_name}")
+                        return calendar_period
+                    # Default to fiscal year (existing behavior)
                     return self.fiscal_calendar.get_current_fiscal_year()
                 elif period_type == "last_year":
+                    # NEW: Check if query explicitly mentions "calendar year"
+                    # If ambiguous, default to fiscal year (existing behavior)
+                    if re.search(r'\bcalendar\s+year\b', query, re.IGNORECASE):
+                        # User explicitly wants calendar year - calculate from Jan 1 to Dec 31
+                        from datetime import date
+                        current_year = date.today().year
+                        prior_calendar_year = current_year - 1
+                        from src.core.fiscal_calendar import FiscalPeriod
+                        calendar_period = FiscalPeriod(
+                            start_date=date(prior_calendar_year, 1, 1),
+                            end_date=date(prior_calendar_year, 12, 31),
+                            period_name=f"Calendar Year {prior_calendar_year}",
+                            fiscal_year=prior_calendar_year,
+                        )
+                        logger.info(f"Detected calendar year request: {calendar_period.period_name}")
+                        return calendar_period
+                    # Default to fiscal year (existing behavior)
                     return self.fiscal_calendar.get_prior_fiscal_year()
                 # Trailing period patterns
                 elif period_type == "ttm":
@@ -1060,15 +1206,22 @@ class QueryParser:
                 # Includes both single-word (e.g., "ADR department") and multi-word (e.g., "Product Marketing department")
                 multi_word_patterns = [
                     # Pattern 1: "for the X Y department" - most common pattern (2-4 words)
-                    r'for\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept)',
-                    # Pattern 2: "X Y department" at word boundary (2-4 words)
-                    r'\b([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept|expense|cost|spend|spending)',
+                    # This is the HIGHEST priority pattern - explicitly matches "for the product management department"
+                    r'for\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept|team|group|org)',
+                    # Pattern 2: "X Y department" at word boundary (2-4 words) - requires suffix
+                    r'\b([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept|team|group|org)',
                     # Pattern 3: "in the X Y department" (2-4 words)
-                    r'in\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept)',
+                    r'in\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept|team|group|org)',
                     # Pattern 4: "of the X Y department" (2-4 words)
-                    r'of\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept)',
+                    r'of\s+the\s+([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:department|dept|team|group|org)',
                     # Pattern 5: Single-word department names (e.g., "ADR department", "IT department")
-                    r'\b([A-Z][A-Za-z0-9]{1,20})\s+(?:department|dept|expense|cost|spend|spending)',
+                    r'\b([A-Z][A-Za-z0-9]{1,20})\s+(?:department|dept|team|group|org)',
+                    # Pattern 6: "all X departments" (plural form)
+                    r'all\s+([A-Za-z&]+(?:\s+[A-Za-z]+){0,2})\s+departments?',
+                    # Pattern 7: "X departments" (plural without "all")
+                    r'\b([A-Za-z&]+(?:\s+[A-Za-z]+){0,2})\s+departments?',
+                    # Pattern 8: Multi-word phrases with expense/cost/spending suffix (looser match)
+                    r'\b([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\s+(?:expense|cost|spend|spending)',
                 ]
                 
                 for pattern_idx, pattern in enumerate(multi_word_patterns):
@@ -1121,7 +1274,7 @@ class QueryParser:
                             # prefer matches where the child part exactly matches the search phrase
                             registry = get_dynamic_registry()
                             if not registry.is_empty():
-                                match_result = registry.lookup(phrase, entity_type=EntityType.DEPARTMENT, min_confidence=0.3)
+                                match_result = registry.lookup(phrase, entity_type=EntityType.DEPARTMENT, min_confidence=0.5)
                                 
                                 # Check if any match has the phrase as the child part (after ":")
                                 best_match = None
@@ -1157,6 +1310,64 @@ class QueryParser:
                 logger.warning(f"Multi-word department lookup failed: {e}")
         
         # =========================================================================
+        # STEP 2.6: Handle parent department expansion (e.g., "all R&D", "R&D departments")
+        # =========================================================================
+        # Check if query mentions "all X" or "X departments" (plural) where X is a parent
+        if DYNAMIC_REGISTRY_AVAILABLE and self.dynamic_registry and not self.dynamic_registry.is_empty():
+            try:
+                # Pattern for "all X" or "X departments" where X might be a parent
+                parent_patterns = [
+                    r'\ball\s+([A-Za-z&]+(?:\s+[A-Za-z]+){0,1})\b',  # "all R&D", "all G&A"
+                    r'\b([A-Za-z&]+(?:\s+[A-Za-z]+){0,1})\s+departments?\b',  # "R&D departments", "G&A departments"
+                ]
+                
+                for pattern in parent_patterns:
+                    matches = re.finditer(pattern, query, re.IGNORECASE)
+                    for match in matches:
+                        parent_term = match.group(1).strip()
+                        start, end = match.span(1)
+                        
+                        # Skip if already claimed
+                        if is_range_claimed(start, end):
+                            continue
+                        
+                        # Check if this is a parent department in the registry
+                        registry = get_dynamic_registry()
+                        parent_match = registry.lookup(parent_term, entity_type=EntityType.DEPARTMENT, min_confidence=0.5)
+                        
+                        if parent_match.matches:
+                            # Check if any match has children (is a parent)
+                            for entry in parent_match.matches:
+                                # Check if this entry has children or is a parent category
+                                canonical = entry.canonical_name
+                                # Parent departments typically have "(Parent)" in the name or have children
+                                if '(Parent)' in canonical or entry.children:
+                                    # Expand to all children
+                                    if entry.children:
+                                        # Use children from registry entry
+                                        expanded = entry.children
+                                    else:
+                                        # Find all departments that start with this parent name
+                                        all_depts = registry.get_all(EntityType.DEPARTMENT)
+                                        expanded = [
+                                            dept.canonical_name for dept in all_depts
+                                            if canonical.lower() in dept.canonical_name.lower() and dept.canonical_name != canonical
+                                        ]
+                                    
+                                    if expanded:
+                                        # Add all children to departments list
+                                        for child in expanded:
+                                            if child not in departments:
+                                                departments.append(child)
+                                        claim_range(start, end)
+                                        logger.info(f"Expanded parent '{parent_term}' to {len(expanded)} children: {expanded[:3]}...")
+                                        # Return early if we found parent expansion
+                                        if departments:
+                                            return departments, clarification_needed
+            except Exception as e:
+                logger.warning(f"Parent department expansion failed: {e}")
+        
+        # =========================================================================
         # STEP 3: Fall back to individual static patterns
         # =========================================================================
         # Only run this if no compound or registry matches found
@@ -1190,7 +1401,8 @@ class QueryParser:
     def _resolve_entity_dynamic(
         self, 
         term: str, 
-        entity_type: EntityType
+        entity_type: EntityType,
+        min_confidence: float = 0.6
     ) -> Tuple[Optional[List[str]], Optional[Dict]]:
         """
         Resolve an entity term using the dynamic registry.
@@ -1198,6 +1410,7 @@ class QueryParser:
         Args:
             term: The term to resolve (e.g., "GPS", "Sales NA")
             entity_type: The type of entity to look for
+            min_confidence: Minimum confidence threshold for matches (default 0.6)
         
         Returns:
             Tuple of (resolved_values, clarification_info)
@@ -1209,7 +1422,18 @@ class QueryParser:
             logger.debug(f"Dynamic registry is empty, cannot resolve '{term}'")
             return None, None
         
-        match = self.dynamic_registry.lookup(term, entity_type)
+        # Adjust confidence threshold based on term complexity
+        is_multi_word = len(term.split()) > 1
+        if is_multi_word:
+            # Multi-word terms need higher confidence to avoid partial matches
+            effective_min_confidence = max(min_confidence, 0.7)
+        else:
+            # Single-word terms can use lower threshold (we rely on child-part matching)
+            effective_min_confidence = min(min_confidence, 0.5)
+        
+        match = self.dynamic_registry.lookup(term, entity_type, min_confidence=effective_min_confidence)
+        
+        logger.debug(f"Registry lookup for '{term}': confidence={match.confidence:.2f}, matches={len(match.matches)}, needs_clarification={match.needs_clarification}")
         
         if match.is_empty:
             # Term not found in registry
@@ -1217,6 +1441,7 @@ class QueryParser:
         
         if match.is_exact:
             # Single confident match - return the canonical name
+            logger.info(f"Exact match for '{term}' -> '{match.best_match.canonical_name}'")
             return [match.best_match.canonical_name], None
         
         if match.needs_clarification:
@@ -1229,11 +1454,94 @@ class QueryParser:
             }
             return None, clarification
         
-        # Lower confidence but single match - use it
-        if match.best_match:
-            return [match.best_match.canonical_name], None
+        # Lower confidence but single match - validate it matches query intent
+        if match.best_match and match.confidence >= min_confidence:
+            canonical = match.best_match.canonical_name
+            
+            # Validate: for multi-word terms, the canonical should contain the query words
+            if not self._validate_department_match(term, canonical):
+                logger.warning(f"Department match validation failed: '{term}' -> '{canonical}'")
+                return None, None
+            
+            logger.info(f"Using best match for '{term}' -> '{canonical}' (conf={match.confidence:.2f})")
+            return [canonical], None
         
         return None, None
+    
+    def _validate_department_match(self, query_term: str, canonical_name: str) -> bool:
+        """
+        Validate that a department match makes sense.
+        
+        Ensures that the query term actually relates to the matched canonical name.
+        For example, "product management" should NOT match "Enterprise Sales".
+        
+        Args:
+            query_term: The search term from the user query
+            canonical_name: The canonical department name from the registry
+            
+        Returns:
+            True if the match is valid, False otherwise
+        """
+        def tokenize(text: str) -> set:
+            """Tokenize text, stripping punctuation."""
+            import re
+            cleaned = re.sub(r'[,&()\-/]', ' ', text.lower())
+            return {w.strip() for w in cleaned.split() if w.strip()}
+        
+        query_words = tokenize(query_term)
+        
+        # Extract meaningful words from canonical name (remove hierarchy markers)
+        canonical_lower = canonical_name.lower()
+        canonical_clean = canonical_lower.replace('(parent)', '').replace(':', ' ')
+        canonical_words = tokenize(canonical_clean)
+        
+        # Remove common words that don't carry meaning
+        noise_words = {'parent', 'na', 'emea', 'apac', 'la', 'corp', 'the', 'and', 'or'}
+        canonical_words = {w for w in canonical_words if w and w not in noise_words}
+        query_words = {w for w in query_words if w and w not in noise_words}
+        
+        if not query_words:
+            return True  # No meaningful query words to validate
+        
+        # For single-word queries, check if the word exists in the canonical name
+        if len(query_words) == 1:
+            query_word = list(query_words)[0]
+            # Single word must appear in canonical words
+            if query_word in canonical_words:
+                return True
+            # Or as a substring in the canonical name (for partial matches)
+            if query_word in canonical_lower:
+                return True
+            logger.debug(f"Single word '{query_word}' not found in canonical '{canonical_name}'")
+            return False
+        
+        # For multi-word queries, require significant word overlap
+        # Get the child part (most specific) of hierarchical names
+        if ' : ' in canonical_lower:
+            child_part = canonical_lower.split(' : ')[-1].strip()
+            child_words = tokenize(child_part)
+            child_words = {w for w in child_words if w and w not in noise_words}
+            
+            # Check if query words match child part
+            matching_in_child = query_words.intersection(child_words)
+            if matching_in_child and len(matching_in_child) >= len(query_words) * 0.5:
+                return True
+            
+            # If no overlap with child part, this is likely a wrong match
+            if not matching_in_child:
+                logger.debug(f"No word overlap between query '{query_term}' and child part '{child_part}'")
+                return False
+        
+        # Check overall word overlap
+        matching_words = query_words.intersection(canonical_words)
+        match_ratio = len(matching_words) / len(query_words)
+        
+        # Require at least 50% word overlap for multi-word queries
+        if match_ratio < 0.5:
+            logger.debug(f"Insufficient word overlap ({match_ratio:.0%}) between '{query_term}' and '{canonical_name}'")
+            return False
+        
+        return True
     
     def _build_clarification_message(
         self, 
@@ -1517,6 +1825,119 @@ class QueryParser:
                     accounts.append(acct)
         
         return accounts
+    
+    def _extract_exclusion_terms(self, query: str, departments: List[str]) -> Tuple[List[str], List[str]]:
+        """
+        Extract exclusion terms from the query.
+        
+        Handles patterns like:
+        - "G&A excluding Finance" → exclude_departments=["Finance"]
+        - "all expenses excluding travel" → exclude_accounts=["travel"]
+        - "R&D departments except Engineering" → exclude_departments=["Engineering"]
+        
+        Args:
+            query: The user's query
+            departments: Already extracted departments (to avoid double-extraction)
+        
+        Returns:
+            Tuple of (exclude_departments, exclude_accounts)
+        """
+        exclude_departments = []
+        exclude_accounts = []
+        query_lower = query.lower()
+        
+        # Pattern 1: "excluding X", "exclude X", "except X", "minus X"
+        # These patterns capture what comes after the exclusion keyword
+        exclusion_patterns = [
+            r"\bexcluding\s+([a-z\s&]+?)(?:\s+(?:department|dept|account|expense|cost)|$|\?|\.)",
+            r"\bexclude\s+([a-z\s&]+?)(?:\s+(?:department|dept|account|expense|cost)|$|\?|\.)",
+            r"\bexcept\s+([a-z\s&]+?)(?:\s+(?:department|dept|account|expense|cost)|$|\?|\.)",
+            r"\bminus\s+([a-z\s&]+?)(?:\s+(?:department|dept|account|expense|cost)|$|\?|\.)",
+        ]
+        
+        for pattern in exclusion_patterns:
+            matches = re.finditer(pattern, query_lower, re.IGNORECASE)
+            for match in matches:
+                excluded_term = match.group(1).strip()
+                
+                # Check if it's a department (use same logic as department extraction)
+                # Try to match against known department patterns or registry
+                if DYNAMIC_REGISTRY_AVAILABLE and self.dynamic_registry and not self.dynamic_registry.is_empty():
+                    registry = get_dynamic_registry()
+                    dept_match = registry.lookup(excluded_term, entity_type=EntityType.DEPARTMENT, min_confidence=0.5)
+                    if dept_match.matches:
+                        # It's a department
+                        canonical = dept_match.matches[0].canonical_name
+                        if canonical not in exclude_departments:
+                            exclude_departments.append(canonical)
+                        continue
+                
+                # Check if it's in the already-extracted departments list
+                excluded_lower = excluded_term.lower()
+                for dept in departments:
+                    if excluded_lower in dept.lower() or dept.lower() in excluded_lower:
+                        if dept not in exclude_departments:
+                            exclude_departments.append(dept)
+                        break
+                else:
+                    # Not a department - might be an account or expense category
+                    # Check if it's a known expense term
+                    from src.core.financial_semantics import get_semantic_term
+                    semantic_term = get_semantic_term(excluded_term)
+                    if semantic_term and semantic_term.category in [
+                        SemanticCategory.ACCOUNT_NAME,
+                        SemanticCategory.ACCOUNT,
+                    ]:
+                        # It's an account-related term
+                        if excluded_term not in exclude_accounts:
+                            exclude_accounts.append(excluded_term)
+                    else:
+                        # Default: treat as department if it looks like one
+                        # (contains common department words or is capitalized)
+                        dept_indicators = ['department', 'dept', 'team', 'group']
+                        if any(indicator in excluded_lower for indicator in dept_indicators):
+                            # Remove indicator words and add as department
+                            cleaned = excluded_term
+                            for indicator in dept_indicators:
+                                cleaned = re.sub(rf'\s*{indicator}\s*', ' ', cleaned, flags=re.IGNORECASE).strip()
+                            if cleaned and cleaned not in exclude_departments:
+                                exclude_departments.append(cleaned)
+        
+        return exclude_departments, exclude_accounts
+    
+    def _is_department_comparison_query(self, query: str, departments: List[str]) -> bool:
+        """
+        Check if query is a department comparison query.
+        
+        Examples:
+        - "Finance vs HR" → True
+        - "Compare Marketing and Sales" → True
+        - "Finance compared to HR" → True
+        
+        Args:
+            query: The user's query (lowercase)
+            departments: List of extracted departments
+        
+        Returns:
+            True if this is a department comparison query
+        """
+        if len(departments) < 2:
+            return False
+        
+        # Check for comparison keywords
+        comparison_keywords = [
+            r'\bvs\.?\b',
+            r'\bversus\b',
+            r'\bcompared\s+to\b',
+            r'\bcompare\s+(?:the\s+)?(?:spending|expenses?|costs?)\s+(?:of\s+)?(?:between\s+)?',
+            r'\bcompare\s+',
+        ]
+        
+        for pattern in comparison_keywords:
+            if re.search(pattern, query, re.IGNORECASE):
+                return True
+        
+        return False
     
     def _extract_top_n(self, query: str) -> Optional[int]:
         """Extract top N value from query."""

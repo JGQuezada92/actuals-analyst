@@ -60,6 +60,7 @@ class AnalysisContext:
     parsed_query: Optional[ParsedQuery] = None
     filtered_data: Optional[List[Dict[str, Any]]] = None
     filter_summary: str = ""
+    comparison_data: Optional[Dict[str, List[Dict[str, Any]]]] = None  # NEW: For department comparisons
     
     # Conversation context
     session: Optional[Session] = None
@@ -284,20 +285,43 @@ as "associated with" not "causes" unless there's clear causal reasoning.
             
             # Phase 4: Analysis Generation with Reflection
             with tracer.start_span("phase_4_analysis_generation", SpanKind.LLM_CALL) as span:
-                context = self._generate_analysis(context, max_iterations)
-                if span:
-                    span.attributes["iteration_count"] = context.iteration_count
+                try:
+                    context = self._generate_analysis(context, max_iterations)
+                    if span:
+                        span.attributes["iteration_count"] = context.iteration_count
+                except Exception as e:
+                    # If LLM fails, continue with empty analysis but keep calculations
+                    error_type = type(e).__name__
+                    logger.error(f"Phase 4 (Analysis Generation) failed: {error_type}: {e}")
+                    logger.info("Continuing with calculations only - analysis text will be empty")
+                    context.analysis_text = f"[Analysis generation unavailable: {error_type}]"
+                    context.iteration_count = 0
+                    if span:
+                        span.attributes["error"] = str(e)
+                        span.attributes["error_type"] = error_type
             
-            # Phase 5: Final Evaluation
-            with tracer.start_span("phase_5_evaluation", SpanKind.EVALUATION) as span:
-                context = self._evaluate_analysis(context)
-                if span and context.evaluation:
-                    span.attributes["evaluation_score"] = context.evaluation.average_qualitative_score
-                    span.attributes["passed_threshold"] = context.evaluation.passes_threshold
-                    tracer.record_evaluation(
-                        score=context.evaluation.average_qualitative_score,
-                        passed=context.evaluation.passes_threshold
-                    )
+            # Phase 5: Final Evaluation (skip if analysis generation failed)
+            if context.analysis_text and not context.analysis_text.startswith("[Analysis generation unavailable"):
+                with tracer.start_span("phase_5_evaluation", SpanKind.EVALUATION) as span:
+                    try:
+                        context = self._evaluate_analysis(context)
+                        if span and context.evaluation:
+                            span.attributes["evaluation_score"] = context.evaluation.average_qualitative_score
+                            span.attributes["passed_threshold"] = context.evaluation.passes_threshold
+                            tracer.record_evaluation(
+                                score=context.evaluation.average_qualitative_score,
+                                passed=context.evaluation.passes_threshold
+                            )
+                    except Exception as e:
+                        # If evaluation fails, continue without evaluation
+                        error_type = type(e).__name__
+                        logger.error(f"Phase 5 (Evaluation) failed: {error_type}: {e}")
+                        logger.info("Continuing without evaluation")
+                        if span:
+                            span.attributes["error"] = str(e)
+                            span.attributes["error_type"] = error_type
+            else:
+                logger.info("Skipping Phase 5 (Evaluation) - analysis generation was unavailable")
             
             # Update session with this conversation
             self._update_session(context)
@@ -495,13 +519,31 @@ as "associated with" not "causes" unless there's clear causal reasoning.
             logger.info(f"Transaction type filter: {result.filter_summary}")
         
         # Apply department filter
+        # NEW: Handle department comparisons separately
         if parsed.departments:
-            result = self.data_processor.apply_filters(
-                data, departments=parsed.departments
-            )
-            data = result.data
-            filters_applied.extend(result.filters_applied)
-            logger.info(f"Department filter: {result.filter_summary}")
+            if parsed.is_department_comparison and len(parsed.departments) >= 2:
+                # For comparisons, filter each department separately
+                comparison_data = {}
+                for dept in parsed.departments:
+                    dept_result = self.data_processor.apply_filters(
+                        data, departments=[dept]
+                    )
+                    comparison_data[dept] = dept_result.data
+                    logger.info(f"Comparison department '{dept}': {dept_result.filter_summary}")
+                
+                # Store comparison data in context (will be used by calculations)
+                context.comparison_data = comparison_data
+                # Use first department's data as primary filtered data for backward compatibility
+                data = comparison_data[parsed.departments[0]] if parsed.departments else []
+                filters_applied.append(f"department comparison: {', '.join(parsed.departments)}")
+            else:
+                # Normal department filter (OR logic)
+                result = self.data_processor.apply_filters(
+                    data, departments=parsed.departments
+                )
+                data = result.data
+                filters_applied.extend(result.filters_applied)
+                logger.info(f"Department filter: {result.filter_summary}")
         
         # Apply account filter (specific account names/numbers)
         if parsed.accounts:
@@ -512,13 +554,87 @@ as "associated with" not "causes" unless there's clear causal reasoning.
             filters_applied.extend(result.filters_applied)
             logger.info(f"Account filter: {result.filter_summary}")
         
+        # NEW: Apply exclusion filters (after inclusion filters)
+        if parsed.exclude_departments or parsed.exclude_accounts:
+            result = self.data_processor.apply_filters(
+                data,
+                exclude_departments=parsed.exclude_departments,
+                exclude_accounts=parsed.exclude_accounts,
+            )
+            data = result.data
+            filters_applied.extend(result.filters_applied)
+            logger.info(f"Exclusion filter: {result.filter_summary}")
+        
         context.filtered_data = data
         context.filter_summary = f"Filtered {context.raw_data.row_count} -> {len(data)} rows"
         
         if filters_applied:
             context.filter_summary += f" ({', '.join(filters_applied)})"
         
+        # NEW: Validate that expected filters were applied
+        self._validate_filters(context, parsed, filters_applied)
+        
         return context
+    
+    def _validate_filters(self, context: AnalysisContext, parsed: ParsedQuery, filters_applied: List[str]):
+        """
+        Validate that expected filters were applied and log warnings if missing.
+        
+        This helps catch cases where filter extraction failed silently.
+        """
+        expected_filters = []
+        missing_filters = []
+        
+        # Check time period filter
+        if parsed.time_period:
+            expected_filters.append("time period")
+            if not any("period" in f.lower() or "date" in f.lower() for f in filters_applied):
+                missing_filters.append(f"Time period filter ({parsed.time_period.period_name})")
+        
+        # Check department filter
+        if parsed.departments and not parsed.is_department_comparison:
+            expected_filters.append("department")
+            if not any("department" in f.lower() for f in filters_applied):
+                missing_filters.append(f"Department filter ({', '.join(parsed.departments)})")
+        
+        # Check account type filter
+        if parsed.account_type_filter:
+            expected_filters.append("account type")
+            if not any("account" in f.lower() and "prefix" in f.lower() for f in filters_applied):
+                missing_filters.append(f"Account type filter ({parsed.account_type_filter})")
+        
+        # Check account name filter
+        if parsed.account_name_filter:
+            expected_filters.append("account name")
+            if not any("account name" in f.lower() for f in filters_applied):
+                missing_filters.append(f"Account name filter ({parsed.account_name_filter})")
+        
+        # Check transaction type filter
+        if parsed.transaction_type_filter:
+            expected_filters.append("transaction type")
+            if not any("type" in f.lower() or "transaction" in f.lower() for f in filters_applied):
+                missing_filters.append(f"Transaction type filter ({parsed.transaction_type_filter})")
+        
+        # Check exclusion filters
+        if parsed.exclude_departments:
+            expected_filters.append("exclude department")
+            if not any("exclude" in f.lower() and "department" in f.lower() for f in filters_applied):
+                missing_filters.append(f"Exclude department filter ({', '.join(parsed.exclude_departments)})")
+        
+        if parsed.exclude_accounts:
+            expected_filters.append("exclude account")
+            if not any("exclude" in f.lower() and "account" in f.lower() for f in filters_applied):
+                missing_filters.append(f"Exclude account filter ({', '.join(parsed.exclude_accounts)})")
+        
+        # Log warnings for missing filters
+        if missing_filters:
+            logger.warning(
+                f"Expected filters were not applied: {', '.join(missing_filters)}. "
+                f"Applied filters: {filters_applied}. "
+                f"This may indicate a filter extraction issue."
+            )
+        else:
+            logger.debug(f"All expected filters were applied: {expected_filters}")
     
     def _update_session(self, context: AnalysisContext):
         """Update the session with this conversation turn."""
