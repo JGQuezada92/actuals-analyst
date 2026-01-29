@@ -24,10 +24,11 @@ from datetime import datetime
 from src.core.model_router import get_router, Message, LLMResponse, ModelRouter
 from src.core.fiscal_calendar import FiscalCalendar, FiscalPeriod, get_fiscal_calendar
 from src.core.query_parser import QueryParser, ParsedQuery, QueryIntent, get_query_parser
-from src.core.memory import Session, SessionManager, get_session_manager
+from src.core.memory import Session, SessionManager, get_session_manager, DisambiguationRecord
 from src.core.data_context import DataContext, get_data_context
 from src.core.financial_semantics import apply_disambiguation_choice, get_semantic_term
 from src.core.query_cost_estimator import QueryCostEstimator, QueryCostEstimate, get_query_cost_estimator
+from src.core.query_rewriter import QueryRewriter, get_query_rewriter
 from src.core.observability import get_tracer, SpanKind
 from src.core.prompt_manager import get_prompt_manager
 from src.tools.netsuite_client import NetSuiteDataRetriever, SavedSearchResult, get_data_retriever
@@ -163,6 +164,7 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         data_context: Optional[DataContext] = None,
         cost_estimator: Optional[QueryCostEstimator] = None,
         statistical_analyzer: Optional[StatisticalAnalyzer] = None,
+        query_rewriter: Optional[QueryRewriter] = None,
     ):
         self.data_retriever = data_retriever or get_data_retriever()
         self.calculator = calculator or get_calculator()
@@ -178,6 +180,7 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         self.statistical_analyzer = statistical_analyzer or get_statistical_analyzer(
             fiscal_start_month=self.fiscal_calendar.fy_start_month
         )
+        self.query_rewriter = query_rewriter or get_query_rewriter(self.router)
         self.prompt_manager = get_prompt_manager()
         self.config = get_config()
     
@@ -219,10 +222,42 @@ as "associated with" not "causes" unless there's clear causal reasoning.
             trace_id = trace.trace_id if trace else None
             
             # Get or create session for conversation memory
+            # load_session tries disk persistence first, then memory cache
             if session is None and session_id:
-                session = self.session_manager.get_session(session_id)
+                session = self.session_manager.load_session(session_id)
+                if session:
+                    logger.info(f"Loaded existing session {session_id} (turns: {len(session.turns)}, pending: {session.has_pending_disambiguation()})")
             if session is None:
                 session = self.session_manager.create_session()
+                logger.info(f"Created new session {session.session_id}")
+            
+            # Check for pending disambiguation response
+            # If session has pending disambiguation and this query looks like a response, merge them
+            if session and session.has_pending_disambiguation():
+                merged_result = self._try_merge_disambiguation_response(query, session)
+                if merged_result:
+                    # User's response was successfully parsed as a disambiguation choice
+                    query, disambiguation_choice = merged_result
+                    logger.info(f"Merged disambiguation response with pending query: {query[:50]}...")
+                    logger.info(f"Disambiguation choice: {disambiguation_choice}")
+            
+            # Phase -1: Query Rewriting (for conversational follow-ups)
+            # This handles messages like "filter by department instead" or "same thing for G&A"
+            # Only runs if disambiguation merge didn't handle the message
+            original_query = query
+            if session and session.turns and not disambiguation_choice:
+                with tracer.start_span("phase_minus1_query_rewriting", SpanKind.PIPELINE_PHASE) as span:
+                    rewritten = self.query_rewriter.rewrite_if_needed(query, session)
+                    if rewritten and rewritten != query:
+                        logger.info(f"Rewrote follow-up: '{query[:50]}...' -> '{rewritten[:50]}...'")
+                        query = rewritten
+                        if span:
+                            span.attributes["original_query"] = original_query[:100]
+                            span.attributes["rewritten_query"] = rewritten[:100]
+                            span.attributes["was_rewritten"] = True
+                    else:
+                        if span:
+                            span.attributes["was_rewritten"] = False
             
             # Phase 0: Parse Query
             with tracer.start_span("phase_0_query_parsing", SpanKind.PIPELINE_PHASE) as span:
@@ -236,7 +271,8 @@ as "associated with" not "causes" unless there's clear causal reasoning.
             if parsed_query.requires_disambiguation:
                 if disambiguation_choice:
                     # User has provided their choice, apply it
-                    parsed_query = self._apply_disambiguation(parsed_query, disambiguation_choice)
+                    # Pass session to record disambiguation for future topic-aware rewriting
+                    parsed_query = self._apply_disambiguation(parsed_query, disambiguation_choice, session)
                     logger.info(f"Applied disambiguation choice: {disambiguation_choice}")
                 else:
                     # Return early asking for clarification
@@ -332,13 +368,18 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         self,
         parsed_query: ParsedQuery,
         choices: Dict[str, int],
+        session: Optional[Session] = None,
     ) -> ParsedQuery:
         """
         Apply user's disambiguation choices to update the parsed query.
         
+        Also records the disambiguation choice in the session for future
+        topic-aware query rewriting.
+        
         Args:
             parsed_query: The original parsed query with ambiguous terms
             choices: Dict mapping term -> choice index (1-based for user-friendly display)
+            session: Optional session to record disambiguation choices
         
         Returns:
             Updated ParsedQuery with resolved semantic filters
@@ -348,28 +389,104 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         resolved_terms = set()
         unresolved_terms = []
         
+        # Generate topic summary for disambiguation records
+        topic_summary = self._summarize_topic(parsed_query) if session else ""
+        
         for term, choice_index in choices.items():
             # Check if this is a department disambiguation from registry
             if term in parsed_query.department_disambiguation_options:
                 options = parsed_query.department_disambiguation_options[term]
-                # Convert 1-based user choice to 0-based index
-                user_choice = choice_index - 1 if choice_index > 0 else choice_index
-                if 0 <= user_choice < len(options):
-                    selected_dept = options[user_choice]
-                    # Replace the ambiguous term with the selected department
-                    if term in parsed_query.departments:
-                        parsed_query.departments.remove(term)
-                    parsed_query.departments.append(selected_dept)
-                    logger.info(f"Resolved department '{term}' to '{selected_dept}' (choice {choice_index})")
-                    # Remove from disambiguation options after successful resolution
-                    parsed_query.department_disambiguation_options.pop(term, None)
-                    resolved_terms.add(term)
+                
+                # Handle both old format (list of strings) and new format (list of dicts)
+                # New format: [{"num": 1, "label": "...", "filter_values": [...], "is_consolidated": bool}, ...]
+                # Old format: ["dept1", "dept2", ...]
+                
+                if options and isinstance(options[0], dict):
+                    # NEW enhanced format with filter_values
+                    # Find option by 'num' field (user's 1-based choice)
+                    selected_option = None
+                    for opt in options:
+                        if opt.get("num") == choice_index:
+                            selected_option = opt
+                            break
+                    
+                    if selected_option:
+                        filter_values = selected_option.get("filter_values", [])
+                        is_consolidated = selected_option.get("is_consolidated", False)
+                        label = selected_option.get("label", "")
+                        
+                        # Replace the ambiguous term with selected department(s)
+                        if term in parsed_query.departments:
+                            parsed_query.departments.remove(term)
+                        
+                        # Add all filter values (supports consolidated option with multiple departments)
+                        for dept in filter_values:
+                            if dept not in parsed_query.departments:
+                                parsed_query.departments.append(dept)
+                        
+                        logger.info(
+                            f"Resolved department '{term}' to {len(filter_values)} department(s): "
+                            f"{filter_values[:3]}{'...' if len(filter_values) > 3 else ''} "
+                            f"(choice {choice_index}, consolidated={is_consolidated})"
+                        )
+                        
+                        # Remove from disambiguation options after successful resolution
+                        parsed_query.department_disambiguation_options.pop(term, None)
+                        resolved_terms.add(term)
+                        
+                        # Record disambiguation choice in session
+                        if session:
+                            record = DisambiguationRecord(
+                                term=term,
+                                chosen_dimension="department",
+                                chosen_value={
+                                    "label": label,
+                                    "departments": filter_values,
+                                    "is_consolidated": is_consolidated
+                                },
+                                topic_summary=topic_summary,
+                                turn_index=len(session.turns),
+                                disambiguation_type="entity",  # Entity-level disambiguation
+                            )
+                            session.resolved_disambiguations.append(record)
+                            logger.info(f"Recorded entity disambiguation: '{term}' -> {label}")
+                    else:
+                        logger.warning(
+                            f"Invalid choice {choice_index} for term '{term}' "
+                            f"(valid options: {[o.get('num') for o in options]}). Keeping term unresolved."
+                        )
+                        unresolved_terms.append(term)
                 else:
-                    logger.warning(
-                        f"Invalid choice index {choice_index} for term '{term}' "
-                        f"(valid range: 1-{len(options)}). Keeping term unresolved."
-                    )
-                    unresolved_terms.append(term)
+                    # OLD format - list of strings (backward compatibility)
+                    user_choice = choice_index - 1 if choice_index > 0 else choice_index
+                    if 0 <= user_choice < len(options):
+                        selected_dept = options[user_choice]
+                        # Replace the ambiguous term with the selected department
+                        if term in parsed_query.departments:
+                            parsed_query.departments.remove(term)
+                        parsed_query.departments.append(selected_dept)
+                        logger.info(f"Resolved department '{term}' to '{selected_dept}' (choice {choice_index})")
+                        # Remove from disambiguation options after successful resolution
+                        parsed_query.department_disambiguation_options.pop(term, None)
+                        resolved_terms.add(term)
+                        
+                        # Record disambiguation choice in session
+                        if session:
+                            record = DisambiguationRecord(
+                                term=term,
+                                chosen_dimension="department",
+                                chosen_value={"name": selected_dept},
+                                topic_summary=topic_summary,
+                                turn_index=len(session.turns),
+                            )
+                            session.resolved_disambiguations.append(record)
+                            logger.info(f"Recorded disambiguation: '{term}' -> department '{selected_dept}'")
+                    else:
+                        logger.warning(
+                            f"Invalid choice index {choice_index} for term '{term}' "
+                            f"(valid range: 1-{len(options)}). Keeping term unresolved."
+                        )
+                        unresolved_terms.append(term)
                 continue
             
             # Handle semantic term disambiguation (existing logic)
@@ -383,12 +500,57 @@ as "associated with" not "causes" unless there's clear causal reasoning.
                     resolved_terms.add(term)
                     
                     if resolved.category == SemanticCategory.ACCOUNT:
+                        # User chose to filter by ACCOUNT, not department
+                        # Set the account filter
                         parsed_query.account_type_filter = {
                             "filter_type": resolved.filter_type.value,
                             "values": resolved.filter_values,
                         }
+                        # IMPORTANT: Remove the term from departments if it was there
+                        # because user explicitly chose account, not department
+                        term_upper = term.upper()
+                        term_lower = term.lower()
+                        depts_to_remove = [
+                            d for d in parsed_query.departments
+                            if d.upper() == term_upper or d.lower() == term_lower
+                            or term_lower in d.lower()  # Handle "R&D" matching "R&D (Parent)"
+                        ]
+                        for d in depts_to_remove:
+                            parsed_query.departments.remove(d)
+                            logger.info(f"Removed department '{d}' - user chose account filter instead")
+                        
+                        # Record disambiguation choice in session
+                        if session:
+                            record = DisambiguationRecord(
+                                term=term,
+                                chosen_dimension="account",
+                                chosen_value={
+                                    "filter_type": resolved.filter_type.value,
+                                    "values": resolved.filter_values,
+                                },
+                                topic_summary=topic_summary,
+                                turn_index=len(session.turns),
+                            )
+                            session.resolved_disambiguations.append(record)
+                            logger.info(f"Recorded disambiguation: '{term}' -> account filter")
+                        
                     elif resolved.category == SemanticCategory.DEPARTMENT:
+                        # User chose to filter by DEPARTMENT, not account
                         parsed_query.departments.extend(resolved.filter_values)
+                        # Remove any account type filter that was set for this term
+                        # (in case both were initially extracted)
+                        
+                        # Record disambiguation choice in session
+                        if session:
+                            record = DisambiguationRecord(
+                                term=term,
+                                chosen_dimension="department",
+                                chosen_value={"departments": resolved.filter_values},
+                                topic_summary=topic_summary,
+                                turn_index=len(session.turns),
+                            )
+                            session.resolved_disambiguations.append(record)
+                            logger.info(f"Recorded disambiguation: '{term}' -> department filter")
                 else:
                     unresolved_terms.append(term)
                     logger.warning(f"Failed to resolve semantic term '{term}' with choice {choice_index}")
@@ -421,6 +583,60 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         
         return parsed_query
     
+    def _summarize_topic(self, parsed_query: ParsedQuery) -> str:
+        """
+        Generate a brief topic summary for a parsed query.
+        
+        Used to help the LLM determine if a follow-up query is related
+        to the same topic as a previous disambiguation.
+        
+        Args:
+            parsed_query: The parsed query to summarize
+        
+        Returns:
+            Brief string describing the query topic (e.g., "R&D expenses analysis")
+        """
+        # Add intent - use actual QueryIntent enum values
+        intent_map = {
+            QueryIntent.SUMMARY: "summary",
+            QueryIntent.TOTAL: "totals",
+            QueryIntent.TREND: "trend analysis",
+            QueryIntent.COMPARISON: "comparison",
+            QueryIntent.VARIANCE: "variance analysis",
+            QueryIntent.BREAKDOWN: "breakdown",
+            QueryIntent.TOP_N: "top items",
+            QueryIntent.DETAIL: "details",
+            QueryIntent.RATIO: "ratio analysis",
+            QueryIntent.CORRELATION: "correlation analysis",
+            QueryIntent.REGRESSION: "regression analysis",
+            QueryIntent.VOLATILITY: "volatility analysis",
+        }
+        intent_str = intent_map.get(parsed_query.intent, "analysis")
+        
+        # Add primary entities (departments, accounts)
+        entities = []
+        if parsed_query.departments:
+            entities.extend(parsed_query.departments[:2])  # Limit to first 2
+        if parsed_query.account_type_filter:
+            filter_vals = parsed_query.account_type_filter.get("values", [])
+            if filter_vals:
+                entities.append(f"accounts {filter_vals[0]}")
+        
+        # Add time period if present
+        time_str = ""
+        if parsed_query.time_period:
+            tp = parsed_query.time_period
+            # FiscalPeriod uses period_name, not period_type
+            if hasattr(tp, 'period_name') and tp.period_name:
+                time_str = f" for {tp.period_name}"
+        
+        # Construct summary
+        if entities:
+            entity_str = ", ".join(entities[:2])
+            return f"{entity_str} {intent_str}{time_str}"
+        else:
+            return f"financial {intent_str}{time_str}"
+    
     def _build_disambiguation_response(
         self,
         query: str,
@@ -429,7 +645,66 @@ as "associated with" not "causes" unless there's clear causal reasoning.
     ) -> AgentResponse:
         """
         Build a response asking for clarification on ambiguous terms.
+        Also stores the pending query context in the session for follow-up.
         """
+        # Store pending disambiguation context in session for follow-up
+        if session:
+            # Build disambiguation options dict for persistence
+            disambiguation_options = {}
+            for term in parsed_query.ambiguous_terms:
+                # Get options from department disambiguation options first
+                if term in parsed_query.department_disambiguation_options:
+                    dept_options = parsed_query.department_disambiguation_options[term]
+                    
+                    # Handle enhanced format (list of dicts with filter_values)
+                    if dept_options and isinstance(dept_options[0], dict):
+                        # Already in enhanced format - preserve it
+                        disambiguation_options[term] = [
+                            {
+                                "num": opt.get("num"),
+                                "label": opt.get("label"),
+                                "description": opt.get("description", ""),
+                                "type": "department",
+                                "filter_values": opt.get("filter_values", []),
+                                "is_consolidated": opt.get("is_consolidated", False)
+                            }
+                            for opt in dept_options
+                        ]
+                    else:
+                        # Old format - convert to standard format
+                        disambiguation_options[term] = [
+                            {"label": opt, "type": "department"} 
+                            for opt in dept_options
+                        ]
+                else:
+                    # Check semantic_terms list for disambiguation options
+                    # semantic_terms is a list of dicts from SemanticTerm.to_dict()
+                    for sem_term in parsed_query.semantic_terms:
+                        if sem_term.get("term", "").lower() == term.lower():
+                            if sem_term.get("disambiguation_options"):
+                                disambiguation_options[term] = sem_term["disambiguation_options"]
+                            break
+            
+            session.set_pending_disambiguation(
+                query=query,
+                parsed_query_dict={
+                    "intent": parsed_query.intent.value,
+                    "departments": parsed_query.departments,
+                    "accounts": parsed_query.accounts,
+                    "time_period": parsed_query.time_period.to_dict() if parsed_query.time_period else None,
+                    "ambiguous_terms": parsed_query.ambiguous_terms,
+                },
+                ambiguous_terms=parsed_query.ambiguous_terms,
+                disambiguation_options=disambiguation_options,
+            )
+            
+            # Add user message to conversation history
+            session.add_user_message(content=query)
+            
+            # Save session with pending disambiguation
+            self.session_manager.save_session(session.session_id)
+            logger.info(f"Saved pending disambiguation for session {session.session_id}")
+        
         return AgentResponse(
             analysis="",
             calculations=[],
@@ -446,6 +721,115 @@ as "associated with" not "causes" unless there's clear causal reasoning.
             ambiguous_terms=parsed_query.ambiguous_terms,
             pending_query=query,
         )
+    
+    def _try_merge_disambiguation_response(
+        self,
+        user_response: str,
+        session: Session,
+    ) -> Optional[tuple]:
+        """
+        Try to parse a user's response as a disambiguation choice.
+        
+        If successful, returns (original_query, disambiguation_choice_dict).
+        If the response doesn't look like a disambiguation choice, returns None.
+        
+        Examples of disambiguation responses:
+        - "1" or "2" or "3" (numeric choice)
+        - "account" or "accounts" (choosing account dimension)
+        - "department" or "departments" (choosing department dimension)
+        - "I mean filter by account"
+        - "R&D departments please"
+        - "both" (if that's an option)
+        """
+        import re
+        
+        if not session.pending_query or not session.pending_ambiguous_terms:
+            return None
+        
+        response_lower = user_response.lower().strip()
+        pending_terms = session.pending_ambiguous_terms
+        pending_options = session.pending_disambiguation_options or {}
+        
+        # Short responses are more likely to be disambiguation choices
+        is_short_response = len(response_lower.split()) <= 10
+        
+        disambiguation_choice = {}
+        
+        # Pattern 1: Numeric choice (e.g., "1", "2", "option 1")
+        numeric_match = re.search(r'\b(\d)\b', response_lower)
+        if numeric_match and is_short_response:
+            choice_num = int(numeric_match.group(1))
+            # Apply to all pending terms (user chose a single option number)
+            for term in pending_terms:
+                disambiguation_choice[term] = choice_num
+            logger.info(f"Parsed numeric disambiguation choice: {choice_num} for terms {pending_terms}")
+            return (session.pending_query, disambiguation_choice)
+        
+        # Pattern 2: Keyword matching for account/department/both
+        account_keywords = ["account", "accounts", "filter by account", "account number", "52"]
+        department_keywords = ["department", "departments", "filter by department", "org", "hierarchy"]
+        both_keywords = ["both", "all", "both account and department", "accounts and departments"]
+        
+        for term in pending_terms:
+            options = pending_options.get(term, [])
+            
+            # Check for "both" option (usually option 3)
+            if any(kw in response_lower for kw in both_keywords):
+                # "Both" is typically option 3
+                for i, opt in enumerate(options):
+                    if isinstance(opt, dict) and "both" in opt.get("label", "").lower():
+                        disambiguation_choice[term] = i + 1  # 1-based
+                        break
+                else:
+                    disambiguation_choice[term] = 3  # Default "both" position
+                continue
+            
+            # Check for account option (usually option 1)
+            if any(kw in response_lower for kw in account_keywords):
+                for i, opt in enumerate(options):
+                    if isinstance(opt, dict) and "account" in opt.get("label", "").lower():
+                        disambiguation_choice[term] = i + 1
+                        break
+                else:
+                    disambiguation_choice[term] = 1  # Default account position
+                continue
+            
+            # Check for department option (usually option 2)
+            if any(kw in response_lower for kw in department_keywords):
+                for i, opt in enumerate(options):
+                    if isinstance(opt, dict) and "department" in opt.get("label", "").lower():
+                        disambiguation_choice[term] = i + 1
+                        break
+                else:
+                    disambiguation_choice[term] = 2  # Default department position
+                continue
+        
+        # If we found choices for all pending terms, return the merge
+        if disambiguation_choice and len(disambiguation_choice) == len(pending_terms):
+            logger.info(f"Parsed keyword disambiguation choice: {disambiguation_choice}")
+            return (session.pending_query, disambiguation_choice)
+        
+        # Pattern 3: If response is very short and session has pending, assume it's related
+        # and try to extract context
+        if is_short_response and len(response_lower) < 50:
+            # Check if response mentions any of the disambiguation options by label
+            for term in pending_terms:
+                options = pending_options.get(term, [])
+                for i, opt in enumerate(options):
+                    if isinstance(opt, dict):
+                        label = opt.get("label", "").lower()
+                        if label and label in response_lower:
+                            disambiguation_choice[term] = i + 1
+                            break
+            
+            if disambiguation_choice:
+                logger.info(f"Parsed label-based disambiguation choice: {disambiguation_choice}")
+                return (session.pending_query, disambiguation_choice)
+        
+        # Could not parse as disambiguation response
+        # This might be a new query entirely
+        logger.debug(f"Response '{user_response[:50]}' not recognized as disambiguation choice")
+        return None
     
     def analyze_sync(
         self,
@@ -637,9 +1021,14 @@ as "associated with" not "causes" unless there's clear causal reasoning.
             logger.debug(f"All expected filters were applied: {expected_filters}")
     
     def _update_session(self, context: AnalysisContext):
-        """Update the session with this conversation turn."""
+        """Update the session with this conversation turn and save to disk."""
         if not context.session:
             return
+        
+        # Clear any pending disambiguation since we completed the analysis
+        if context.session.has_pending_disambiguation():
+            context.session.clear_pending_disambiguation()
+            logger.debug("Cleared pending disambiguation after successful analysis")
         
         # Add user message
         parsed = context.parsed_query
@@ -662,6 +1051,10 @@ as "associated with" not "causes" unless there's clear causal reasoning.
                 "time_period": parsed.time_period.period_name if parsed and parsed.time_period else None,
             },
         )
+        
+        # Save session to disk for persistence across process invocations
+        self.session_manager.save_session(context.session.session_id)
+        logger.debug(f"Saved session {context.session.session_id} to disk")
     
     async def _retrieve_data(
         self,
@@ -1024,13 +1417,36 @@ as "associated with" not "causes" unless there's clear causal reasoning.
         sample_rows = context.working_data[:10]
         sample_data = json.dumps(sample_rows, indent=2, default=str)
         
+        # Build explicit time context from parsed fiscal period
+        time_context_parts = []
+        
+        # Add fiscal period details if available
+        if context.parsed_query and context.parsed_query.time_period:
+            tp = context.parsed_query.time_period
+            time_context_parts.append(f"Fiscal Period: {tp.period_name}")
+            time_context_parts.append(f"Date Range: {tp.start_date.strftime('%B %d, %Y')} through {tp.end_date.strftime('%B %d, %Y')}")
+            time_context_parts.append(f"Fiscal Year: FY{tp.fiscal_year}")
+            
+            # Add fiscal year explanation (Feb start means FY named after ending year)
+            if self.fiscal_calendar.fy_start_month == 2:
+                fy_start_year = tp.fiscal_year - 1
+                time_context_parts.append(
+                    f"Note: FY{tp.fiscal_year} runs from February {fy_start_year} through January {tp.fiscal_year} "
+                    f"(our fiscal year starts in February)"
+                )
+        
+        # Also get actual transaction date range from data for reference
         date_range = "Not available"
         for col in context.raw_data.column_names:
             if 'date' in col.lower():
                 dates = [row.get(col) for row in context.working_data if row.get(col)]
                 if dates:
                     date_range = f"{min(dates)} to {max(dates)}"
+                    time_context_parts.append(f"Transaction dates in data: {date_range}")
                 break
+        
+        # Combine into full time context
+        full_time_context = "\n".join(time_context_parts) if time_context_parts else date_range
         
         category_breakdown = ""
         category_calcs = [c for c in context.calculations if 'Total' in c.metric_name]
@@ -1080,7 +1496,7 @@ as "associated with" not "causes" unless there's clear causal reasoning.
             query=query_context,
                 data_summary=f"- Total rows: {len(context.working_data)}\n- Date range: {date_range}\n- Columns available: {', '.join(context.raw_data.column_names)}",
             calculations=calc_summary or "No calculations available",
-                time_context=date_range,
+                time_context=full_time_context,
                 filter_summary=f"Filtered data: {len(context.working_data)} rows",
                 conversation_context=conversation_context + parsed_info + data_context_info,
                 statistical_context=statistical_context,

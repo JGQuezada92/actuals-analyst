@@ -3,6 +3,7 @@ import { cn } from '@/lib/utils';
 import { User, Bot, AlertCircle, ExternalLink, CheckCircle } from 'lucide-react';
 import { CalculationCard } from './calculation-card';
 import { AnalysisFormatter } from './analysis-formatter';
+import { ClarificationOptions } from './clarification-options';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -10,11 +11,24 @@ import { Link } from 'react-router-dom';
 
 interface MessageBubbleProps {
   message: ChatMessage;
+  onSendMessage?: (message: string) => void;
+  isLastMessage?: boolean;
+  isLoading?: boolean;
 }
 
-export function MessageBubble({ message }: MessageBubbleProps) {
+export function MessageBubble({ message, onSendMessage, isLastMessage = false, isLoading = false }: MessageBubbleProps) {
   const isUser = message.role === 'user';
   const isError = message.role === 'system' && message.content.startsWith('Error:');
+  const hasClarification = message.metadata?.clarification?.requiresClarification;
+  
+  // Clarification options should only be interactive for the last message when not loading
+  const isClarificationDisabled = !isLastMessage || isLoading;
+
+  const handleClarificationSelect = (optionValue: string) => {
+    if (onSendMessage) {
+      onSendMessage(optionValue);
+    }
+  };
 
   return (
     <div className={cn('flex gap-4 mb-6', isUser ? 'flex-row-reverse' : 'flex-row')}>
@@ -62,6 +76,14 @@ export function MessageBubble({ message }: MessageBubbleProps) {
             <p className="whitespace-pre-wrap text-sm leading-relaxed">
               {message.content}
             </p>
+          ) : hasClarification ? (
+            <div className="p-5">
+              <ClarificationOptions 
+                clarification={message.metadata!.clarification!}
+                onSelectOption={handleClarificationSelect}
+                disabled={isClarificationDisabled}
+              />
+            </div>
           ) : (
             <div className="p-5">
               <AnalysisFormatter content={message.content} />

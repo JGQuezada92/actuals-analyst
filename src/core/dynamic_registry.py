@@ -377,6 +377,7 @@ class DynamicRegistry:
         entity_type: EntityType = None,
         min_confidence: float = 0.5,
         max_results: int = 10,
+        query_context: str = None,
     ) -> RegistryMatch:
         """
         Look up a term in the registry.
@@ -386,6 +387,7 @@ class DynamicRegistry:
             entity_type: Limit search to this entity type (optional)
             min_confidence: Minimum confidence score to include (0.0-1.0). Default 0.5 (raised from 0.3)
             max_results: Maximum number of matches to return
+            query_context: Optional full query string for disambiguation context
         
         Returns:
             RegistryMatch with matches and clarification info
@@ -436,7 +438,22 @@ class DynamicRegistry:
                     needs_clarification=False,
                 )
             
-            # Multiple distinct exact matches -> needs clarification
+            # Multiple distinct exact matches -> try contextual disambiguation first
+            if query_context and entity_type == EntityType.DEPARTMENT:
+                disambiguated = self._disambiguate_from_query_context(
+                    term, matched_entries, query_context
+                )
+                if disambiguated:
+                    # Return single match with high confidence
+                    return RegistryMatch(
+                        term=term,
+                        entity_type=disambiguated.entity_type,
+                        matches=[disambiguated],
+                        confidence=0.95,
+                        needs_clarification=False,
+                    )
+            
+            # Still ambiguous -> needs clarification
             return RegistryMatch(
                 term=term,
                 entity_type=entity_type or matched_entries[0].entity_type,
@@ -549,6 +566,65 @@ class DynamicRegistry:
             clarification_options=[e.canonical_name for e in matched_entries],
         )
     
+    def _disambiguate_from_query_context(
+        self,
+        term: str,
+        matches: List[RegistryEntry],
+        query: str,
+    ) -> Optional[RegistryEntry]:
+        """
+        Try to disambiguate department from query context.
+        
+        Uses ONLY explicit geographic hints (NA, INTL, EMEA, APAC) to pick
+        a specific match. Parent category terms (R&D, G&A, Sales, CoS) are
+        NOT auto-disambiguated - these require user clarification since
+        multiple sub-departments could be the intended target.
+        
+        Args:
+            term: The original search term
+            matches: List of matching RegistryEntry objects
+            query: Full query string for context
+            
+        Returns:
+            Single RegistryEntry if disambiguation successful, None otherwise
+        """
+        query_lower = query.lower()
+        
+        # Geographic disambiguation - these are specific enough to auto-select
+        # Only apply if user explicitly mentions a region
+        if re.search(r'\b(na|us|north\s*america|united\s*states|domestic)\b', query_lower):
+            for m in matches:
+                canonical_lower = m.canonical_name.lower()
+                if ' na' in canonical_lower or 'na ' in canonical_lower or canonical_lower.endswith(' na'):
+                    logger.info(f"Disambiguated '{term}' to '{m.canonical_name}' via NA context")
+                    return m
+        
+        if re.search(r'\b(intl|international|global|emea|apac)\b', query_lower):
+            for m in matches:
+                canonical_lower = m.canonical_name.lower()
+                if 'intl' in canonical_lower or 'international' in canonical_lower:
+                    logger.info(f"Disambiguated '{term}' to '{m.canonical_name}' via INTL context")
+                    return m
+                if 'emea' in canonical_lower:
+                    logger.info(f"Disambiguated '{term}' to '{m.canonical_name}' via EMEA context")
+                    return m
+                if 'apac' in canonical_lower:
+                    logger.info(f"Disambiguated '{term}' to '{m.canonical_name}' via APAC context")
+                    return m
+        
+        # NOTE: Parent category disambiguation (R&D, G&A, Sales, CoS, Marketing)
+        # has been REMOVED. When a term matches multiple departments under a parent
+        # hierarchy, we now require user clarification instead of auto-selecting.
+        # This ensures users can choose:
+        #   - All departments under the parent (consolidated)
+        #   - Just the parent category
+        #   - A specific sub-department
+        #
+        # See: build_entity_disambiguation_message() for clarification options
+        
+        logger.debug(f"No auto-disambiguation for '{term}' - requires user clarification ({len(matches)} matches)")
+        return None
+    
     def lookup_multiple(
         self,
         terms: List[str],
@@ -573,6 +649,76 @@ class DynamicRegistry:
     def get_all_canonical_names(self, entity_type: EntityType) -> List[str]:
         """Get all canonical names for an entity type."""
         return list(self._registry.get(entity_type, {}).keys())
+    
+    def get_hierarchy_members(
+        self, 
+        parent_prefix: str, 
+        entity_type: EntityType = EntityType.DEPARTMENT
+    ) -> List[str]:
+        """
+        Get all entities under a parent hierarchy.
+        
+        For example, get_hierarchy_members("R&D (Parent)") returns:
+        - R&D (Parent)
+        - R&D (Parent) : Product Management
+        - R&D (Parent) : Engineering (Parent)
+        - R&D (Parent) : Engineering (Parent) : Engineering 1 - Siva
+        - ... all other R&D sub-departments
+        
+        Args:
+            parent_prefix: The parent category prefix (e.g., "R&D (Parent)")
+            entity_type: The entity type to search (default: DEPARTMENT)
+            
+        Returns:
+            List of canonical names that start with the parent prefix
+        """
+        all_names = self.get_all_canonical_names(entity_type)
+        # Include exact match and all children
+        members = [
+            name for name in all_names 
+            if name == parent_prefix or name.startswith(parent_prefix + " :")
+        ]
+        return sorted(members)
+    
+    def find_parent_for_term(self, term: str) -> Optional[str]:
+        """
+        Find the parent category prefix for a search term.
+        
+        Maps common terms to their parent hierarchy:
+        - "r&d", "research" -> "R&D (Parent)"
+        - "g&a", "general admin" -> "G&A (Parent)"
+        - "sales" -> "Sales (Parent)"
+        - "cos", "cost of sales" -> "Cost of Sales (Parent)"
+        - "marketing" -> "Marketing (Parent)"
+        
+        Args:
+            term: The search term (e.g., "R&D", "Sales")
+            
+        Returns:
+            Parent prefix if found, None otherwise
+        """
+        term_lower = term.lower().strip()
+        
+        parent_mappings = {
+            "r&d": "R&D (Parent)",
+            "rd": "R&D (Parent)",
+            "research": "R&D (Parent)",
+            "research and development": "R&D (Parent)",
+            "g&a": "G&A (Parent)",
+            "ga": "G&A (Parent)",
+            "general admin": "G&A (Parent)",
+            "general and admin": "G&A (Parent)",
+            "general & admin": "G&A (Parent)",
+            "general and administrative": "G&A (Parent)",
+            "sales": "Sales (Parent)",
+            "cos": "Cost of Sales (Parent)",
+            "cost of sales": "Cost of Sales (Parent)",
+            "cogs": "Cost of Sales (Parent)",
+            "marketing": "Marketing (Parent)",
+            "mktg": "Marketing (Parent)",
+        }
+        
+        return parent_mappings.get(term_lower)
     
     @property
     def stats(self) -> Dict[str, Any]:

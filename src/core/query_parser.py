@@ -110,6 +110,14 @@ class ParsedQuery:
     # Department disambiguation options (NEW - for registry-based department matching)
     department_disambiguation_options: Dict[str, List[str]] = field(default_factory=dict)  # term -> [options]
     
+    # Entity-level disambiguation (NEW - for multiple matching entities within a dimension)
+    # This is different from dimension disambiguation (account vs department)
+    # Entity disambiguation asks "which specific R&D department?" when multiple match
+    requires_entity_disambiguation: bool = False
+    entity_disambiguation_term: Optional[str] = None  # The ambiguous term (e.g., "R&D")
+    entity_disambiguation_options: List[Dict[str, Any]] = field(default_factory=list)  # Options to present
+    entity_disambiguation_type: Optional[str] = None  # "department", "account", etc.
+    
     # Resolved semantic terms for reference
     semantic_terms: List[Dict[str, Any]] = field(default_factory=list)
     
@@ -146,6 +154,10 @@ class ParsedQuery:
             "disambiguation_message": self.disambiguation_message,
             "ambiguous_terms": self.ambiguous_terms,
             "department_disambiguation_options": self.department_disambiguation_options,  # NEW
+            "requires_entity_disambiguation": self.requires_entity_disambiguation,
+            "entity_disambiguation_term": self.entity_disambiguation_term,
+            "entity_disambiguation_options": self.entity_disambiguation_options,
+            "entity_disambiguation_type": self.entity_disambiguation_type,
             "exclude_departments": self.exclude_departments,  # NEW
             "exclude_accounts": self.exclude_accounts,  # NEW
             "top_n": self.top_n,
@@ -264,6 +276,83 @@ class QueryParser:
         else:
             self.dynamic_registry = None
     
+    def _preprocess_query(self, query: str) -> Tuple[str, List[str]]:
+        """
+        Pre-process query before parsing.
+        
+        Normalizes synonyms and removes noise phrases to improve pattern matching.
+        Returns (normalized_query, list_of_transformations_applied).
+        
+        This is a LIGHT preprocessing step - heavy lifting is still done by
+        the existing parsing infrastructure.
+        """
+        transformations = []
+        normalized = query
+        
+        # =========================================================================
+        # VERB SYNONYM NORMALIZATION
+        # =========================================================================
+        # Normalize question starters to a consistent form
+        verb_synonyms = [
+            (r'^give\s+me\s+', 'show '),
+            (r'^tell\s+me\s+', 'show '),
+            (r'^get\s+me\s+', 'show '),
+            (r'^find\s+', 'show '),
+            (r'^list\s+', 'show '),
+            (r'^display\s+', 'show '),
+            (r"^what(?:'s| is| are)\s+(?:the\s+)?", 'show '),
+            (r'^how\s+much\s+', 'show total '),
+        ]
+        
+        for pattern, replacement in verb_synonyms:
+            if re.match(pattern, normalized, re.IGNORECASE):
+                normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+                transformations.append(f"verb_normalized: '{pattern}' -> '{replacement}'")
+                break  # Only apply first match
+        
+        # =========================================================================
+        # NOISE PHRASE REMOVAL
+        # =========================================================================
+        noise_phrases = [
+            r'\bfor all of the\b',
+            r'\bfor all of\b',
+            r'\bcan you\b',
+            r'\bcould you\b',
+            r'\bplease\b',
+            r'\bi want to see\b',
+            r'\bi need to know\b',
+            r'\bi\'d like to see\b',
+        ]
+        
+        for phrase in noise_phrases:
+            if re.search(phrase, normalized, re.IGNORECASE):
+                original = normalized
+                normalized = re.sub(phrase, ' ', normalized, flags=re.IGNORECASE)
+                if normalized != original:
+                    transformations.append(f"removed_noise: '{phrase}'")
+        
+        # =========================================================================
+        # METRIC SYNONYM NORMALIZATION  
+        # =========================================================================
+        metric_synonyms = [
+            (r'\bspending\b', 'expense'),
+            (r'\bspend\b', 'expense'),
+            (r'\bexpenditures?\b', 'expense'),
+        ]
+        
+        for pattern, replacement in metric_synonyms:
+            if re.search(pattern, normalized, re.IGNORECASE):
+                normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+                transformations.append(f"metric_normalized: '{pattern}' -> '{replacement}'")
+        
+        # Clean up whitespace
+        normalized = ' '.join(normalized.split())
+        
+        if transformations:
+            logger.debug(f"Query preprocessed: {transformations}")
+        
+        return normalized, transformations
+    
     def parse(self, query: str, context: Dict[str, Any] = None) -> ParsedQuery:
         """
         Parse a user query into structured form.
@@ -275,11 +364,19 @@ class QueryParser:
         Returns:
             ParsedQuery with extracted information
         """
-        query_lower = query.lower().strip()
+        # Pre-process query for normalization
+        normalized_query, preprocessing_notes = self._preprocess_query(query)
+        
+        # Use normalized query for parsing, but keep original for reference
+        query_to_parse = normalized_query
+        query_lower = query_to_parse.lower().strip()
+        
         notes = []
+        if preprocessing_notes:
+            notes.append(f"Preprocessing: {preprocessing_notes}")
         
         # NEW: Extract semantic filters FIRST (this determines what is an account vs department)
-        semantic_result = self._extract_semantic_filters(query)
+        semantic_result = self._extract_semantic_filters(query_to_parse)
         
         # Initialize disambiguation variables early (used in department checking)
         requires_disambiguation = semantic_result.get("requires_disambiguation", False)
@@ -293,7 +390,11 @@ class QueryParser:
         # Extract time period
         time_period = self._extract_time_period(query_lower)
         if time_period:
-            notes.append(f"Time period: {time_period.period_name}")
+            # Check if this was an implicit default
+            if hasattr(time_period, '_implicit_default') and time_period._implicit_default:
+                notes.append(f"Time period (implicit default): {time_period.period_name}")
+            else:
+                notes.append(f"Time period: {time_period.period_name}")
         
         # Extract comparison
         comparison_type, comparison_period = self._extract_comparison(query_lower, time_period)
@@ -405,7 +506,8 @@ class QueryParser:
                 
                 for dept in departments:
                     # Check if this department term matches multiple actual departments
-                    match = registry.lookup(dept, entity_type=EntityType.DEPARTMENT, min_confidence=0.5)
+                    # Pass query context to help with geographic/organizational disambiguation
+                    match = registry.lookup(dept, entity_type=EntityType.DEPARTMENT, min_confidence=0.5, query_context=query_to_parse)
                     
                     if match.needs_clarification and len(match.clarification_options) > 1:
                         # Multiple matches found - needs disambiguation
@@ -429,28 +531,126 @@ class QueryParser:
                         logger.debug(f"Department '{dept}' not found in registry, keeping as-is")
                 
                 if ambiguous_departments:
-                    # Build disambiguation message
+                    # Build disambiguation message with consolidated option
                     clarification_parts = []
                     for amb_dept in ambiguous_departments:
+                        term = amb_dept["term"]
+                        options = amb_dept["options"]
+                        
+                        # Check if options share a common parent (e.g., all are R&D sub-departments)
+                        parent_prefix = registry.find_parent_for_term(term)
+                        
+                        # Build enhanced options list with consolidated option
+                        enhanced_options = []
+                        option_num = 1
+                        
+                        if parent_prefix:
+                            # Add "All X (consolidated)" as first option
+                            all_members = registry.get_hierarchy_members(parent_prefix)
+                            enhanced_options.append({
+                                "num": option_num,
+                                "label": f"All {term.upper()} departments (consolidated)",
+                                "description": f"Includes {parent_prefix} and all {len(all_members)} sub-departments",
+                                "filter_values": all_members,
+                                "is_consolidated": True
+                            })
+                            option_num += 1
+                            
+                            # Add "Parent only" option if parent exists in options
+                            if parent_prefix in options:
+                                enhanced_options.append({
+                                    "num": option_num,
+                                    "label": f"{parent_prefix} only",
+                                    "description": "Just the parent category, no sub-departments",
+                                    "filter_values": [parent_prefix],
+                                    "is_consolidated": False
+                                })
+                                option_num += 1
+                        
+                        # Add individual department options
+                        for opt in sorted(options):
+                            # Skip parent if already added above
+                            if parent_prefix and opt == parent_prefix:
+                                continue
+                            enhanced_options.append({
+                                "num": option_num,
+                                "label": opt,
+                                "description": "",
+                                "filter_values": [opt],
+                                "is_consolidated": False
+                            })
+                            option_num += 1
+                        
+                        # Build display message
                         options_str = "\n".join(
-                            f"  {i+1}. {opt}" 
-                            for i, opt in enumerate(amb_dept["options"][:10])
+                            f"  {opt['num']}. {opt['label']}"
+                            + (f"\n     ({opt['description']})" if opt['description'] else "")
+                            for opt in enhanced_options[:15]  # Limit to 15 options
                         )
+                        
                         clarification_parts.append(
-                            f'The department "{amb_dept["term"]}" matches multiple departments:\n'
+                            f'The term "{term}" matches multiple departments:\n\n'
                             f'{options_str}\n\n'
-                            f'Which one did you mean? Please specify the exact department name (e.g., "1" for the first option).'
+                            f'Please specify which one you mean (e.g., "1" for consolidated, or a specific number).'
                         )
-                        # Store options for later resolution
-                        department_disambiguation_options[amb_dept["term"]] = amb_dept["options"]
+                        
+                        # Store enhanced options for later resolution
+                        department_disambiguation_options[term] = enhanced_options
                     
                     requires_disambiguation = True
                     disambiguation_message = "\n\n".join(clarification_parts)
                     ambiguous_terms.extend([d["term"] for d in ambiguous_departments])
-                    logger.info(f"Department disambiguation required for: {ambiguous_terms}")
+                    logger.info(f"Department entity disambiguation required for: {ambiguous_terms}")
                 else:
                     # All departments resolved - use resolved canonical names
                     departments = resolved_departments
+        
+        # Contextual disambiguation: if we have departments and an ambiguous term (e.g. "sales")
+        # appears as a word in a MORE SPECIFIC resolved department name (e.g. "Sales NA"), 
+        # treat it as resolved so we proceed to fetch data instead of asking for clarification.
+        # 
+        # IMPORTANT: Only resolve if the department is MORE SPECIFIC than the term itself.
+        # E.g., "Sales NA" resolves "sales", but "R&D" alone does NOT resolve "r&d"
+        # because "R&D" could still mean R&D accounts (52xxx) or R&D departments.
+        if departments and ambiguous_terms:
+            still_ambiguous = []
+            for term in ambiguous_terms:
+                term_lower = term.lower()
+                term_resolved = False
+                
+                for dept in departments:
+                    dept_lower = dept.lower()
+                    # Check if term appears in department name
+                    if re.search(r"\b" + re.escape(term_lower) + r"\b", dept_lower):
+                        # Only resolve if department is MORE SPECIFIC than the term
+                        # (contains additional words/context beyond just the term)
+                        dept_words = set(re.findall(r'\w+', dept_lower))
+                        term_words = set(re.findall(r'\w+', term_lower))
+                        
+                        # Department must have additional context (more words than term)
+                        # or be a hierarchical name (contains ":")
+                        if len(dept_words) > len(term_words) or ':' in dept:
+                            logger.info(
+                                f"Ambiguous term '{term}' resolved by specific department context: '{dept}'"
+                            )
+                            term_resolved = True
+                            break
+                        else:
+                            # Same term, no additional context - still ambiguous
+                            logger.info(
+                                f"Ambiguous term '{term}' NOT resolved - department '{dept}' is not more specific"
+                            )
+                
+                if not term_resolved:
+                    still_ambiguous.append(term)
+            
+            if not still_ambiguous and ambiguous_terms:
+                requires_disambiguation = False
+                disambiguation_message = None
+                ambiguous_terms = []
+                logger.info("All ambiguous terms resolved by specific department context")
+            else:
+                ambiguous_terms = still_ambiguous
         
         if departments:
             notes.append(f"Departments: {departments}")
@@ -618,6 +818,111 @@ class QueryParser:
         
         return prefixes
     
+    def _resolve_explicit_dimensions(
+        self, 
+        query: str, 
+        terms: List["SemanticTerm"]
+    ) -> List["SemanticTerm"]:
+        """
+        Resolve explicit dimension qualifiers in the query.
+        
+        When the query contains patterns like "R&D department" or "R&D accounts",
+        this explicitly resolves the dimension ambiguity (account vs department).
+        
+        This prevents re-triggering disambiguation for terms where the user
+        has explicitly specified the dimension.
+        
+        Args:
+            query: The query string
+            terms: List of SemanticTerm objects with potential ambiguity
+            
+        Returns:
+            Updated list of SemanticTerm objects with explicit dimensions resolved
+        """
+        from src.core.financial_semantics import (
+            SemanticTerm, SemanticCategory, FilterType, 
+            apply_disambiguation_choice, get_semantic_term
+        )
+        
+        query_lower = query.lower()
+        resolved_terms = []
+        
+        for term in terms:
+            if not term.disambiguation_required:
+                # Already resolved, keep as-is
+                resolved_terms.append(term)
+                continue
+            
+            term_lower = term.term.lower()
+            
+            # Check for explicit "department" qualifier
+            # Patterns: "R&D department", "R&D dept", "department R&D"
+            dept_patterns = [
+                rf"\b{re.escape(term_lower)}\s+(?:department|dept|departments)\b",
+                rf"\b(?:department|dept|departments)\s+{re.escape(term_lower)}\b",
+                rf"\bfor\s+{re.escape(term_lower)}\s+department\b",
+                rf"\bthe\s+{re.escape(term_lower)}\s+department\b",
+            ]
+            
+            # Check for explicit "account" qualifier
+            # Patterns: "R&D accounts", "R&D account", "account R&D"
+            acct_patterns = [
+                rf"\b{re.escape(term_lower)}\s+(?:accounts?|acct)\b",
+                rf"\b(?:accounts?|acct)\s+{re.escape(term_lower)}\b",
+                rf"\bfor\s+{re.escape(term_lower)}\s+accounts?\b",
+            ]
+            
+            is_explicit_department = any(
+                re.search(p, query_lower) for p in dept_patterns
+            )
+            is_explicit_account = any(
+                re.search(p, query_lower) for p in acct_patterns
+            )
+            
+            if is_explicit_department:
+                # User explicitly wants department - resolve to department
+                logger.info(f"Explicit dimension detected: '{term.term}' -> department (from query context)")
+                
+                # Get the semantic term and apply department choice
+                semantic_term = get_semantic_term(term.term)
+                if semantic_term and semantic_term.disambiguation_options:
+                    # Find the department option (usually index 1 = departments)
+                    for i, option in enumerate(semantic_term.disambiguation_options):
+                        if option.get("label", "").lower().find("department") >= 0:
+                            resolved = apply_disambiguation_choice(semantic_term, i)
+                            if resolved:
+                                resolved_terms.append(resolved)
+                                break
+                    else:
+                        # Default: apply second option (department) if no explicit match
+                        resolved = apply_disambiguation_choice(semantic_term, 1)
+                        if resolved:
+                            resolved_terms.append(resolved)
+                        else:
+                            resolved_terms.append(term)
+                else:
+                    resolved_terms.append(term)
+                    
+            elif is_explicit_account:
+                # User explicitly wants account - resolve to account
+                logger.info(f"Explicit dimension detected: '{term.term}' -> account (from query context)")
+                
+                semantic_term = get_semantic_term(term.term)
+                if semantic_term and semantic_term.disambiguation_options:
+                    # Apply account choice (usually index 0)
+                    resolved = apply_disambiguation_choice(semantic_term, 0)
+                    if resolved:
+                        resolved_terms.append(resolved)
+                    else:
+                        resolved_terms.append(term)
+                else:
+                    resolved_terms.append(term)
+            else:
+                # No explicit qualifier - keep as ambiguous
+                resolved_terms.append(term)
+        
+        return resolved_terms
+    
     def _extract_semantic_filters(self, query: str) -> Dict[str, Any]:
         """
         Extract semantic filters from the query using the financial_semantics module.
@@ -661,6 +966,13 @@ class QueryParser:
             return result
         
         # Store resolved terms for reference
+        result["semantic_terms"] = [t.to_dict() for t in resolved_terms]
+        
+        # NEW: Resolve explicit dimension qualifiers BEFORE checking disambiguation
+        # If query contains "R&D department" or "R&D accounts", resolve the ambiguity
+        resolved_terms = self._resolve_explicit_dimensions(query, resolved_terms)
+        
+        # Update semantic_terms after explicit resolution
         result["semantic_terms"] = [t.to_dict() for t in resolved_terms]
         
         # Check for ambiguous terms first
@@ -991,7 +1303,49 @@ class QueryParser:
             num_months = int(months_match.group(1))
             return self.fiscal_calendar.get_trailing_months(num_months)
         
-        # Log if no time period was extracted
+        # =========================================================================
+        # Smart default time period injection
+        # =========================================================================
+        # If no explicit time period found, check if this is an expense/cost query
+        # that should default to YTD (most common use case for financial analysis)
+        
+        expense_indicators = [
+            r'\bexpense[s]?\b',
+            r'\bspend(?:ing)?\b', 
+            r'\bcost[s]?\b',
+            r'\bopex\b',
+            r'\boperating\s+expense[s]?\b',
+            r'\bbudget\b',
+        ]
+        
+        is_expense_query = any(
+            re.search(pattern, query, re.IGNORECASE) 
+            for pattern in expense_indicators
+        )
+        
+        # Also default to YTD for revenue queries
+        revenue_indicators = [
+            r'\brevenue[s]?\b',
+            r'\bincome\b',
+            r'\bsales\s+revenue\b',
+        ]
+        
+        is_revenue_query = any(
+            re.search(pattern, query, re.IGNORECASE)
+            for pattern in revenue_indicators
+        )
+        
+        if is_expense_query or is_revenue_query:
+            logger.info(
+                f"No explicit time period in query, defaulting to YTD for "
+                f"{'expense' if is_expense_query else 'revenue'} query"
+            )
+            ytd_period = self.fiscal_calendar.get_ytd_range()
+            # Mark that this was an implicit default (for transparency)
+            ytd_period._implicit_default = True
+            return ytd_period
+        
+        # For non-financial queries (or ambiguous ones), log and return None
         logger.warning(f"No time period extracted from query: {query[:100]}")
         return None
     

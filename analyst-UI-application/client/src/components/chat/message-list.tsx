@@ -1,5 +1,6 @@
 import { useChatStore } from '@/stores/chat-store';
 import { MessageBubble } from './message-bubble';
+import { useSocket } from '@/hooks/use-socket';
 import { useEffect, useRef } from 'react';
 import { Bot } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
@@ -8,6 +9,7 @@ export function MessageList() {
   const messages = useChatStore((state) => state.messages);
   const currentPhase = useChatStore((state) => state.currentPhase);
   const isLoading = useChatStore((state) => state.isLoading);
+  const { sendMessage } = useSocket();
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -18,8 +20,14 @@ export function MessageList() {
 
   return (
     <div className="space-y-4" ref={scrollRef}>
-      {messages.map((message) => (
-        <MessageBubble key={message.id} message={message} />
+      {messages.map((message, index) => (
+        <MessageBubble 
+          key={message.id} 
+          message={message} 
+          onSendMessage={sendMessage}
+          isLastMessage={index === messages.length - 1}
+          isLoading={isLoading}
+        />
       ))}
       
       {isLoading && (

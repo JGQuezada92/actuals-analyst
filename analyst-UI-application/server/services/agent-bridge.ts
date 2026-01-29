@@ -29,7 +29,7 @@ export class AgentBridge extends EventEmitter {
 
   async analyzeQuery(
     query: string,
-    options: { includeCharts?: boolean; maxIterations?: number } = {},
+    options: { includeCharts?: boolean; maxIterations?: number; sessionId?: string } = {},
     onProgress?: (response: AgentResponse) => void
   ): Promise<any> {
     const requestId = uuidv4();
@@ -44,6 +44,11 @@ export class AgentBridge extends EventEmitter {
 
       if (options.maxIterations) {
         cmdArgs.push('--iterations', options.maxIterations.toString());
+      }
+
+      // Pass session ID for conversation continuity
+      if (options.sessionId) {
+        cmdArgs.push('--session', options.sessionId);
       }
 
       // On Windows, use cmd.exe to handle "py -3.13" command

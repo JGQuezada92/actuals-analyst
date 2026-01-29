@@ -1,3 +1,17 @@
+export interface ClarificationOption {
+  id: number;
+  label: string;
+  description: string;
+  value: string;
+}
+
+export interface ClarificationData {
+  requiresClarification: boolean;
+  clarificationMessage: string;
+  ambiguousTerms: string[];
+  options: ClarificationOption[];
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
@@ -8,6 +22,7 @@ export interface ChatMessage {
     charts?: any[];
     traceId?: string;
     evaluation?: any;
+    clarification?: ClarificationData;
   };
 }
 

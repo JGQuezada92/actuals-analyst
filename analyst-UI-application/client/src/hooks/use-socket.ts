@@ -8,7 +8,7 @@ const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:3001';
 export function useSocket() {
   const socketRef = useRef<Socket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
-  const { addMessage, setLoading, setPhase } = useChatStore();
+  const { addMessage, setLoading, setPhase, setSessionId, sessionId } = useChatStore();
 
   useEffect(() => {
     // Initialize socket
@@ -50,6 +50,12 @@ export function useSocket() {
       addMessage(response);
       setLoading(false);
       setPhase(null);
+      
+      // Extract and store sessionId from response for conversation continuity
+      if (response.metadata?.sessionId) {
+        console.log(`📎 Session ID received: ${response.metadata.sessionId}`);
+        setSessionId(response.metadata.sessionId);
+      }
     });
 
     socket.on('chat:error', (data: { messageId: string; error: string; timestamp: string }) => {
@@ -66,12 +72,19 @@ export function useSocket() {
     return () => {
       socket.disconnect();
     };
-  }, [addMessage, setLoading, setPhase]);
+  }, [addMessage, setLoading, setPhase, setSessionId]);
 
   const sendMessage = (message: string, options?: { includeCharts?: boolean; maxIterations?: number }) => {
     if (!socketRef.current?.connected) {
       console.error('Socket not connected');
       return;
+    }
+
+    // Get current sessionId from store
+    const currentSessionId = useChatStore.getState().sessionId;
+    
+    if (currentSessionId) {
+      console.log(`📎 Sending with session ID: ${currentSessionId}`);
     }
 
     // Add user message to store
@@ -82,10 +95,11 @@ export function useSocket() {
       timestamp: new Date().toISOString(),
     });
 
-    // Send to server
+    // Send to server with sessionId for conversation continuity
     socketRef.current.emit('chat:message', {
       message,
       options: options || {},
+      sessionId: currentSessionId,  // Include session ID from client store
     });
   };
 

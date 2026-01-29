@@ -5,9 +5,11 @@ interface ChatState {
   messages: ChatMessage[];
   isLoading: boolean;
   currentPhase: string | null;
+  sessionId: string | null;  // Track session ID for conversation continuity
   addMessage: (message: ChatMessage) => void;
   setLoading: (loading: boolean) => void;
   setPhase: (phase: string | null) => void;
+  setSessionId: (sessionId: string) => void;
   clearMessages: () => void;
 }
 
@@ -15,6 +17,7 @@ export const useChatStore = create<ChatState>((set) => ({
   messages: [],
   isLoading: false,
   currentPhase: null,
+  sessionId: null,
   
   addMessage: (message) =>
     set((state) => ({
@@ -27,7 +30,10 @@ export const useChatStore = create<ChatState>((set) => ({
   setPhase: (phase) =>
     set({ currentPhase: phase }),
   
+  setSessionId: (sessionId) =>
+    set({ sessionId }),
+  
   clearMessages: () =>
-    set({ messages: [], isLoading: false, currentPhase: null }),
+    set({ messages: [], isLoading: false, currentPhase: null, sessionId: null }),
 }));
 

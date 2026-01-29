@@ -40,6 +40,7 @@ user_prompt_template: |
   {query}
 
   ## Time Context
+  CRITICAL: Use these EXACT dates in your analysis. Do NOT make up or assume different dates.
   {time_context}
 
   ## Data Summary
@@ -57,6 +58,8 @@ user_prompt_template: |
   {statistical_context}
 
   Provide your analysis following the structure in your instructions.
+  IMPORTANT: When mentioning fiscal year dates, use EXACTLY the dates shown in Time Context above.
+  Our fiscal year starts in February (not January). For example, FY2026 = Feb 2025 through Jan 2026.
 
 required_variables:
   - query

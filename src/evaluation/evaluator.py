@@ -99,6 +99,65 @@ class EvaluationResult:
             "improvement_suggestions": self.improvement_suggestions,
         }
 
+
+@dataclass
+class QualityGateConfig:
+    """Configuration for quality gates."""
+    min_qualitative_score: float = 6.0
+    min_numerical_accuracy: float = 0.90
+    allow_degraded_response: bool = True
+    include_quality_warning: bool = True
+
+
+class QualityGate:
+    """
+    Enforces quality standards before responses are delivered.
+    
+    Works with existing EvaluationResult from EvaluationHarness.
+    """
+    
+    def __init__(self, config: Optional[QualityGateConfig] = None):
+        self.config = config or QualityGateConfig()
+    
+    def check(self, evaluation: EvaluationResult) -> Tuple[bool, Optional[str]]:
+        """
+        Check if evaluation passes quality gate.
+        
+        Args:
+            evaluation: Result from EvaluationHarness.evaluate_analysis()
+            
+        Returns:
+            Tuple of (passes, warning_message_or_none)
+        """
+        issues = []
+        
+        # Check qualitative score
+        qual_score = evaluation.average_qualitative_score
+        if qual_score < self.config.min_qualitative_score:
+            issues.append(f"quality score ({qual_score:.1f}/10)")
+        
+        # Check numerical accuracy
+        if evaluation.objective_accuracy < self.config.min_numerical_accuracy:
+            issues.append(f"numerical accuracy ({evaluation.objective_accuracy:.0%})")
+        
+        if not issues:
+            return True, None
+        
+        if self.config.allow_degraded_response:
+            warning = (
+                f"**Quality Notice**: This analysis has potential issues with "
+                f"{', '.join(issues)}. Please verify important figures."
+            )
+            return True, warning
+        else:
+            return False, f"Unable to provide analysis due to quality issues: {', '.join(issues)}"
+
+
+def get_quality_gate(config: Optional[QualityGateConfig] = None) -> QualityGate:
+    """Get a quality gate instance."""
+    return QualityGate(config)
+
+
 class ObjectiveEvaluator:
     """
     Deterministic evaluation of numerical accuracy.

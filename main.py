@@ -57,13 +57,19 @@ def cmd_analyze(args):
     from src.agents.financial_analyst import get_financial_analyst
     
     query = args.query
-    logger.info(f"Running analysis: {query}")
+    session_id = getattr(args, 'session', None)
+    
+    if session_id:
+        logger.info(f"Running analysis with session {session_id}: {query}")
+    else:
+        logger.info(f"Running analysis: {query}")
     
     agent = get_financial_analyst()
     response = asyncio.run(agent.analyze(
         query=query,
         include_charts=args.charts,
         max_iterations=args.iterations,
+        session_id=session_id,
     ))
     
     # Check if JSON output is requested (for UI integration)
@@ -601,6 +607,8 @@ Environment Variables:
                                help='Disable chart generation')
     analyze_parser.add_argument('--iterations', type=int, default=3,
                                help='Max reflection iterations')
+    analyze_parser.add_argument('--session', type=str, default=None,
+                               help='Session ID for conversation continuity')
     analyze_parser.set_defaults(func=cmd_analyze)
     
     # Test command
